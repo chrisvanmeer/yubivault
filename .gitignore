@@ -1,0 +1,24 @@
+# Executables and Binaries
+/yubivault
+/server
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Standalone CLI Binaries
+tailwindcss-*
+
+# Local Configuration & Secrets
+config.yaml
+*.key
+*.crt
+
+# OS & IDE Files
+.DS_Store
+.idea/
+.vscode/
+
+# Go Build/Test Cache
+*.out
+*.test

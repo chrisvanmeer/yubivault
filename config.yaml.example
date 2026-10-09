@@ -1,0 +1,26 @@
+server:
+  listen_addr: "127.0.0.1:8080"
+  session_secret: "super-secret-32-byte-key-here!!"
+  # debug: true -> defaults to false
+
+ui:
+  title: "YubiVault Portal"
+  short_title: "YBV"
+
+vault:
+  address: "https://vault.example.com"
+  pki_mount: "pki_int"
+  pki_role: "yubivault"
+  auth_mount: "jwt-yubivault"
+  auth_role: "yubivault-middleware"
+  # revoke_existing: true -> defaults to false
+
+oidc:
+  issuer: "https://idp.example.com/realms/master"
+  client_id: "yubivault"
+  client_secret: "your-oidc-client-secret"
+  redirect_url: "http://127.0.0.1:18080/callback"
+
+yubico:
+  root_ca_file: "yubico-roots.pem"
+  # rsa_bits: 2048 -> defaults to 3072
