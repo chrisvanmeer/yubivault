@@ -43,12 +43,15 @@ type Config struct {
 		ShortTitle string `yaml:"short_title"`
 	} `yaml:"ui"`
 	Vault struct {
-		Address        string `yaml:"address"`
-		PKIMount       string `yaml:"pki_mount"`
-		PKIRole        string `yaml:"pki_role"`
-		AuthMount      string `yaml:"auth_mount"`
-		AuthRole       string `yaml:"auth_role"`
-		RevokeExisting bool   `yaml:"revoke_existing"`
+		Address         string `yaml:"address"`
+		PKIMount        string `yaml:"pki_mount"`
+		PKIRole         string `yaml:"pki_role"`
+		AuthMount       string `yaml:"auth_mount"`
+		AuthRole        string `yaml:"auth_role"`
+		RevokeExisting  bool   `yaml:"revoke_existing"`
+		AppRoleMount    string `yaml:"approle_mount"`
+		AppRoleRoleID   string `yaml:"approle_role_id"`
+		AppRoleSecretID string `yaml:"approle_secret_id"`
 	} `yaml:"vault"`
 	OIDC struct {
 		Issuer       string `yaml:"issuer"`
@@ -111,6 +114,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Vault.AuthRole == "" {
 		cfg.Vault.AuthRole = "default"
+	}
+	if cfg.Vault.AppRoleMount == "" {
+		cfg.Vault.AppRoleMount = "approle"
 	}
 	if cfg.Yubico.RootCAFile == "" {
 		cfg.Yubico.RootCAFile = "yubico-roots.pem"
@@ -394,6 +400,14 @@ func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Step 1: Revoke existing certificates using Portal AppRole Credentials (if enabled)
+	if s.config.Vault.RevokeExisting {
+		if err := s.revokePreviousCertificates(csr.Subject.CommonName); err != nil {
+			log.Printf("[WARN] Failed during revocation of previous certificates for user %s: %v", csr.Subject.CommonName, err)
+		}
+	}
+
+	// Step 2: Sign new certificate using the USER'S delegated OIDC token
 	vClient, err := vault.NewClient(s.vaultConfig)
 	if err != nil {
 		renderError(w, "Failed to connect to Vault service.")
@@ -417,12 +431,6 @@ func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	if s.config.Server.Debug {
 		log.Printf("[DEBUG] User: %s | Generated Vault Client Token: %s", userIdentity, clientToken)
 		log.Printf("[DEBUG] Assigned Policies: %v", authResp.Auth.Policies)
-	}
-
-	if s.config.Vault.RevokeExisting {
-		if err := s.revokePreviousCertificates(vClient, csr.Subject.CommonName); err != nil {
-			log.Printf("[WARN] Failed during revocation of previous certificates for user %s: %v", csr.Subject.CommonName, err)
-		}
 	}
 
 	vaultSignPath := fmt.Sprintf("%s/sign/%s", s.config.Vault.PKIMount, s.config.Vault.PKIRole)
@@ -491,9 +499,30 @@ func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	`, template.HTMLEscapeString(certData), template.HTMLEscapeString(selectedSlot))
 }
 
-func (s *Server) revokePreviousCertificates(vClient *vault.Client, commonName string) error {
+// Strictly revokes active, unexpired certificates matching the Common Name using Portal AppRole credentials
+func (s *Server) revokePreviousCertificates(commonName string) error {
+	if s.config.Vault.AppRoleRoleID == "" || s.config.Vault.AppRoleSecretID == "" {
+		return errors.New("missing AppRole credentials in configuration for certificate revocation")
+	}
+
+	appClient, err := vault.NewClient(s.vaultConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create Vault AppRole client: %w", err)
+	}
+
+	appRoleLoginPath := fmt.Sprintf("auth/%s/login", s.config.Vault.AppRoleMount)
+	authResp, err := appClient.Logical().Write(appRoleLoginPath, map[string]interface{}{
+		"role_id":   s.config.Vault.AppRoleRoleID,
+		"secret_id": s.config.Vault.AppRoleSecretID,
+	})
+	if err != nil || authResp == nil || authResp.Auth == nil {
+		return fmt.Errorf("AppRole authentication failed: %w", err)
+	}
+
+	appClient.SetToken(authResp.Auth.ClientToken)
+
 	listPath := fmt.Sprintf("%s/certs", s.config.Vault.PKIMount)
-	secret, err := vClient.Logical().List(listPath)
+	secret, err := appClient.Logical().List(listPath)
 	if err != nil || secret == nil || secret.Data == nil {
 		return nil
 	}
@@ -511,7 +540,7 @@ func (s *Server) revokePreviousCertificates(vClient *vault.Client, commonName st
 			continue
 		}
 
-		certSecret, err := vClient.Logical().Read(fmt.Sprintf("%s/cert/%s", s.config.Vault.PKIMount, serial))
+		certSecret, err := appClient.Logical().Read(fmt.Sprintf("%s/cert/%s", s.config.Vault.PKIMount, serial))
 		if err != nil || certSecret == nil || certSecret.Data == nil {
 			continue
 		}
@@ -551,9 +580,9 @@ func (s *Server) revokePreviousCertificates(vClient *vault.Client, commonName st
 		}
 
 		if cert.Subject.CommonName == commonName {
-			log.Printf("[REVOCATION] Revoking prior active certificate (Serial: %s) for user: %s", serial, commonName)
+			log.Printf("[APPROLE REVOCATION] Revoking prior active certificate (Serial: %s) for user: %s", serial, commonName)
 			revokePath := fmt.Sprintf("%s/revoke", s.config.Vault.PKIMount)
-			_, err := vClient.Logical().Write(revokePath, map[string]interface{}{
+			_, err := appClient.Logical().Write(revokePath, map[string]interface{}{
 				"serial_number": serial,
 			})
 			if err != nil {

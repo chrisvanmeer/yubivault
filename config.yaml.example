@@ -14,6 +14,10 @@ vault:
   auth_mount: "jwt-yubivault"
   auth_role: "yubivault-middleware"
   # revoke_existing: true -> defaults to false
+  # Below settings are needed to revoke
+  # approle_mount: "approle"
+  # approle_role_id: "YOUR_ROLE_ID_HERE"
+  # approle_secret_id: "YOUR_SECRET_ID_HERE"
 
 oidc:
   issuer: "https://idp.example.com/realms/master"

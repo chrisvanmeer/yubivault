@@ -160,6 +160,10 @@ vault:
   auth_mount: "jwt-yubivault"
   auth_role: "yubivault-middleware"
   # revoke_existing: true -> defaults to false
+  # Below settings are needed to revoke
+  # approle_mount: "approle"
+  # approle_role_id: "YOUR_ROLE_ID_HERE"
+  # approle_secret_id: "YOUR_SECRET_ID_HERE"
 
 oidc:
   issuer: "https://idp.example.com/realms/master"
@@ -219,9 +223,19 @@ Ensure the Vault policy allows signing, listing, reading, and revoking certifica
 
 ```hcl
 path "pki_int/sign/yubivault" {
-  capabilities = ["create", "update"]
+  capabilities = ["update"]
 }
+```
 
+### 4. Revocation
+
+If enabled, we need to create an approle role for this and revokes will be using these credentials to not expose
+harmful API endpoints to regular users
+
+#### 1. Vault Policy
+
+```hcl
+# pol-yubivault-backend.hcl
 path "pki_int/certs" {
   capabilities = ["list"]
 }
@@ -233,6 +247,35 @@ path "pki_int/cert/*" {
 path "pki_int/revoke" {
   capabilities = ["create", "update"]
 }
+```
+
+```shell
+vault policy write pol-yubivault-backend pol-yubivault-backend.hcl
+```
+
+#### 2. Enable AppRole
+
+```shell
+vault auth enable approle
+```
+
+#### 3. Create AppRole role
+
+```shell
+vault write auth/approle/role/yubivault-portal \
+    secret_id_ttl=0 \
+    token_num_uses=0 \
+    token_ttl=1h \
+    token_max_ttl=4h \
+    secret_id_num_uses=0 \
+    policies="pol-yubivault-backend"
+```
+
+#### 4. Read AppRole credentials
+
+```shell
+vault read auth/approle/role/yubivault-portal/role-id -format=json | jq -r .data.role_id
+vault write -f auth/approle/role/yubivault-portal/secret-id -format=json | jq -r .data.secret_id
 ```
 
 ---
