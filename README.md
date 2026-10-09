@@ -185,7 +185,7 @@ oidc:
   issuer: "https://idp.example.com/realms/master"
   client_id: "yubivault"
   client_secret: "your-oidc-client-secret"
-  redirect_url: "http://127.0.0.1:18080/callback"
+  redirect_url: "https://reverse.published.url.example.com/callback"
 
 yubico:
   root_ca_file: "yubico-roots.pem"
@@ -322,6 +322,96 @@ To remove the service:
 
 ```bash
 sudo ./yubivault --uninstall
+```
+
+---
+
+## Production Deployment & TLS Requirement
+
+> **⚠️ Security Warning:** YubiVault locally serves unencrypted HTTP traffic only. For a production environment, placing YubiVault behind a Reverse Proxy with TLS/HTTPS termination is **mandatory**.
+
+Because the application processes sensitive OIDC tokens, session cookies, and PKI payloads, HTTPS is required to prevent man-in-the-middle attacks and cookie hijacking.
+
+### Architecture
+
+```txt
+[ Client Browser ]
+       │  (HTTPS / Port 443)
+       ▼
+[ Reverse Proxy (TLS Termination) ]  ── (Caddy / Nginx / Traefik / Apache2 / HAProxy)
+       │  (HTTP / Port 8080)
+       ▼
+[ YubiVault Service ]
+```
+
+### Supported Reverse Proxies
+
+You can use any reverse proxy or ingress controller that supports TLS termination:
+
+- **Caddy** *(Recommended for automated ACME / Let's Encrypt TLS)*
+- **Nginx**
+- **Traefik**
+- **Apache2** (`mod_proxy`)
+- **HAProxy**
+
+### Required Proxy Headers
+
+Ensure your reverse proxy forwards standard `X-Forwarded-*` headers. This is essential for correct OIDC redirects and session handling:
+
+- `Host`: The original request host name.
+- `X-Forwarded-Proto`: Must be set to `https`.
+- `X-Forwarded-For`: The original client IP address.
+
+---
+
+### Configuration Examples
+
+#### Caddy
+
+```caddy
+yubivault.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+#### Nginx
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name yubivault.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/yubivault.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yubivault.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+#### Traefik (Docker Dynamic Configuration)
+
+```yaml
+http:
+  routers:
+    yubivault:
+      rule: "Host(`yubivault.example.com`)"
+      service: yubivault-service
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: myresolver
+
+  services:
+    yubivault-service:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"
 ```
 
 ---
