@@ -12,6 +12,11 @@ YubiVault is an airgapped **Validation Middleware & Vault Delegation Proxy** for
 - **Yubico Root CA Chain Validation**: Validates the YubiKey attestation certificate chain against official Yubico Root CAs.
 - **OIDC Authentication & Delegation**: Authenticates users via OIDC (Keycloak, Entra ID, Authelia, Okta) and exchanges the user's raw ID token with Vault JWT auth, maintaining strict Vault entity alias mapping.
 - **Customizable Branding**: Configurable application title and short title via `config.yaml`.
+- **Audit Trail**: Append-only JSONL audit log of logins, certificate issuance, denials and revocations, including the YubiKey serial and firmware (never ID tokens or secrets).
+- **OIDC Group Authorization**: Optionally restrict certificate issuance (and the inventory/manual pages) to users holding an allowed OIDC group.
+- **YubiKey Identity Capture**: The YubiKey serial number and firmware version are extracted from the attestation certificate and shown on issuance.
+- **`--check-config` CLI**: Validate the configuration, Yubico roots, Vault/AppRole connectivity and OIDC discovery without starting the service.
+- **Rich Readiness Probe**: `/readyz` reports Vault reachability, OIDC discovery and (when enabled) AppRole authentication.
 - **Systemd Management**: Built-in `--install` and `--uninstall` flags for automated systemd service management and production deployment to `/etc/yubivault` and `/usr/local/bin/yubivault`.
 - **Airgapped Design**: Dependencies (HTMX, Tailwind CSS, Favicon, Yubico Root CAs) are served entirely locally without third-party CDNs or runtime internet access.
 - **Dark Mode Support**: Automatic OS theme detection with manual light/dark toggle and `localStorage` persistence.
@@ -242,6 +247,11 @@ oidc:
   # redirect URI registered at your IdP exactly.
   redirect_url: "https://yubivault.example.com/callback"
   # logout_redirect_uri: "https://yubivault.example.com/"  # optional, requires IdP support
+  #   allowed_groups: ["yubivault-users"]
+  #   groups_claim: "groups"  # string or array; defaults to "groups". Nested
+  #                            # claims use a dotted path, e.g.
+  #                            # "resource_access.Vault.roles".
+  # Non-members are not let through: login is rejected with an explicit error.
 
 yubico:
   # PEM bundle with the Yubico PIV root CAs. Fails closed if missing or empty.
@@ -262,6 +272,13 @@ logging:
   # group: "yubivault"
   # `yubivault --install` creates the directory and file with these
   # permissions/ownership and writes /etc/logrotate.d/yubivault.
+
+audit:
+  # Append-only JSONL audit trail of logins, issuance, denials and revocations.
+  # Enabled by default and fail-fast: an enabled audit log must be writable.
+  #   enabled: true
+  #   dir: "/var/log/yubivault"   # defaults to logging.dir
+  #   file: "audit.log"           # rotated by the same logrotate snippet
 ```
 
 ---
@@ -382,6 +399,19 @@ go run server.go
 ```
 
 Access the portal in your browser at `http://127.0.0.1:8080/`.
+
+### Validate Configuration
+
+Before starting (or after editing `config.yaml`), verify the configuration and
+its dependencies without starting the server:
+
+```bash
+./yubivault --check-config
+```
+
+This loads and validates the config, checks the Yubico root CAs, reaches out to
+Vault (and performs an AppRole login when `revoke_existing` is enabled), and
+performs OIDC discovery. It exits non-zero on any failure.
 
 ### Systemd Service Installation (Production)
 

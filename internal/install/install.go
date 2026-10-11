@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"yubivault/internal/config"
 )
@@ -26,8 +27,24 @@ const (
 
 func serviceUnit(cfg *config.Config) string {
 	readWritePaths := ""
-	if dir := cfg.LogDir(); dir != "" {
-		readWritePaths = "ReadWritePaths=" + dir + "\n"
+	var writable []string
+	add := func(d string) {
+		if d == "" {
+			return
+		}
+		for _, existing := range writable {
+			if existing == d {
+				return
+			}
+		}
+		writable = append(writable, d)
+	}
+	add(cfg.LogDir())
+	if cfg.AuditEnabled() {
+		add(cfg.AuditDir())
+	}
+	if len(writable) > 0 {
+		readWritePaths = "ReadWritePaths=" + strings.Join(writable, " ") + "\n"
 	}
 
 	return `[Unit]
@@ -153,6 +170,10 @@ func Install(cfg *config.Config) error {
 		return err
 	}
 
+	if err := setupAudit(cfg); err != nil {
+		return err
+	}
+
 	if err := os.WriteFile(servicePath, []byte(serviceUnit(cfg)), 0o644); err != nil {
 		return fmt.Errorf("failed to write systemd unit: %w", err)
 	}
@@ -207,6 +228,39 @@ func setupLogging(cfg *config.Config) error {
 		"dir", dir, "owner", cfg.Logging.Owner, "group", cfg.Logging.Group)
 
 	return installLogrotate(cfg)
+}
+
+// setupAudit creates the audit log file and assigns it to the service account.
+// It is a no-op when audit logging is disabled. When the audit directory
+// differs from the log directory it is created and owned as well; otherwise
+// setupLogging already prepared it.
+func setupAudit(cfg *config.Config) error {
+	if !cfg.AuditEnabled() {
+		slog.Info("audit trail disabled")
+		return nil
+	}
+	if err := os.MkdirAll(cfg.AuditDir(), 0o750); err != nil {
+		return fmt.Errorf("failed to create audit directory %s: %w", cfg.AuditDir(), err)
+	}
+	path := cfg.AuditFilePath()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		return fmt.Errorf("failed to create audit log %s: %w", path, err)
+	}
+	_ = f.Close()
+
+	if cfg.AuditDir() != cfg.LogDir() {
+		if err := chownPath(cfg.AuditDir(), cfg.Logging.Owner, cfg.Logging.Group); err != nil {
+			return err
+		}
+	}
+	if err := chownPath(path, cfg.Logging.Owner, cfg.Logging.Group); err != nil {
+		return err
+	}
+	slog.Info("prepared audit log",
+		"dir", cfg.AuditDir(), "file", cfg.Audit.File,
+		"owner", cfg.Logging.Owner, "group", cfg.Logging.Group)
+	return nil
 }
 
 // installLogrotate writes /etc/logrotate.d/yubivault so the service log file is

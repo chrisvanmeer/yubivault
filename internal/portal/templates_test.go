@@ -130,6 +130,13 @@ func TestRenderIndex(t *testing.T) {
 		t.Error("logged-out index should offer the login link")
 	}
 
+	denied := indexData(false)
+	denied["LoginError"] = "Access denied: your account is not a member of a group allowed to issue certificates. Contact your administrator."
+	deniedOut := render(t, tmpl, "index.html", denied)
+	if !bytes.Contains([]byte(deniedOut), []byte("Access denied:")) {
+		t.Error("logged-out index with an error should show the login error")
+	}
+
 	loggedIn := render(t, tmpl, "index.html", indexData(true))
 	for _, want := range []string{"CN=chris", "ECCP256", "RSA3072", "selected-keytype-input", "/certs", `const CERT_CN = "chris";`} {
 		if !bytes.Contains([]byte(loggedIn), []byte(want)) {
@@ -204,16 +211,18 @@ func TestRenderIndexManualNav(t *testing.T) {
 func TestRenderCertModal(t *testing.T) {
 	tmpl := parseTemplates(t)
 	out := render(t, tmpl, "cert_modal.html", issuedCert{
-		CertPEM:  "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
-		Serial:   "12:34:56",
-		CN:       "chris",
-		Slot:     "9a",
-		KeyType:  "eccp256",
-		NotAfter: "2027-01-01 00:00 UTC",
-		Issued:   1,
-		Warnings: []string{"heads up"},
+		CertPEM:         "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+		Serial:          "12:34:56",
+		CN:              "chris",
+		Slot:            "9a",
+		KeyType:         "eccp256",
+		NotAfter:        "2027-01-01 00:00 UTC",
+		Issued:          1,
+		Warnings:        []string{"heads up"},
+		YubiKeySerial:   "12345678",
+		YubiKeyFirmware: "5.4.3",
 	})
-	for _, want := range []string{"CN=chris", "12:34:56", "ykman piv certificates import 9a user.crt", "Warnings", "heads up"} {
+	for _, want := range []string{"CN=chris", "12:34:56", "ykman piv certificates import 9a user.crt", "Warnings", "heads up", "12345678", "5.4.3"} {
 		if !bytes.Contains([]byte(out), []byte(want)) {
 			t.Errorf("cert modal missing %q", want)
 		}

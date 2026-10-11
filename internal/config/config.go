@@ -125,6 +125,14 @@ type Config struct {
 		ClientSecret      string `yaml:"client_secret"`
 		RedirectURL       string `yaml:"redirect_url"`
 		LogoutRedirectURI string `yaml:"logout_redirect_uri"`
+		// AllowedGroups restricts certificate issuance (and the derived
+		// inventory/manual endpoints) to OIDC users holding at least one of
+		// these groups. An empty list allows every authenticated user.
+		AllowedGroups []string `yaml:"allowed_groups"`
+		// GroupsClaim names the ID token claim that carries the user's group
+		// memberships. It defaults to "groups" and may hold a delimited string
+		// or an array of strings.
+		GroupsClaim string `yaml:"groups_claim"`
 	} `yaml:"oidc"`
 	Yubico struct {
 		RootCAFile      string   `yaml:"root_ca_file"`
@@ -141,6 +149,18 @@ type Config struct {
 		Owner string  `yaml:"owner"`
 		Group string  `yaml:"group"`
 	} `yaml:"logging"`
+	Audit struct {
+		// Enabled toggles the append-only audit trail. It defaults to true.
+		// Because the audit trail is the security record of a CA front-end, an
+		// enabled audit log must be writable or the process refuses to start.
+		Enabled *bool `yaml:"enabled"`
+		// Dir is the directory the audit log is written to. It defaults to
+		// logging.dir. When file logging is disabled (logging.dir is empty)
+		// this must be set explicitly.
+		Dir *string `yaml:"dir"`
+		// File is the audit log file name inside audit.dir.
+		File string `yaml:"file"`
+	} `yaml:"audit"`
 
 	// logDirExplicit records whether logging.dir was present in the file (as
 	// opposed to being defaulted). It is set by Load.
@@ -358,6 +378,21 @@ func (c *Config) applyDefaults() {
 	if c.Logging.Group == "" {
 		c.Logging.Group = defaultLogGroup
 	}
+	if c.Audit.File == "" {
+		c.Audit.File = "audit.log"
+	}
+	if c.OIDC.GroupsClaim == "" {
+		c.OIDC.GroupsClaim = "groups"
+	}
+	if len(c.OIDC.AllowedGroups) > 0 {
+		trimmed := make([]string, 0, len(c.OIDC.AllowedGroups))
+		for _, g := range c.OIDC.AllowedGroups {
+			if g = strings.TrimSpace(g); g != "" {
+				trimmed = append(trimmed, g)
+			}
+		}
+		c.OIDC.AllowedGroups = trimmed
+	}
 }
 
 // LogDir returns the directory log files are written to. It returns an empty
@@ -383,6 +418,41 @@ func (c *Config) LogFilePath() string {
 		return ""
 	}
 	return filepath.Join(dir, c.Logging.File)
+}
+
+// AuditEnabled reports whether the audit trail is enabled. It defaults to true.
+func (c *Config) AuditEnabled() bool { return boolOr(c.Audit.Enabled, true) }
+
+// AuditDir returns the directory the audit log is written to. When audit.dir
+// is unset it follows logging.dir so a single log directory keeps both the
+// service log and the audit record.
+func (c *Config) AuditDir() string {
+	if c.Audit.Dir != nil {
+		return *c.Audit.Dir
+	}
+	return c.LogDir()
+}
+
+// AuditFilePath returns the active audit log path, or "" when audit logging is
+// disabled.
+func (c *Config) AuditFilePath() string {
+	dir := c.AuditDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, c.Audit.File)
+}
+
+// AllowedGroups returns the OIDC groups allowed to issue certificates. Empty
+// means every authenticated user.
+func (c *Config) AllowedGroups() []string { return c.OIDC.AllowedGroups }
+
+// GroupsClaim returns the ID token claim carrying the user's groups.
+func (c *Config) GroupsClaim() string {
+	if c.OIDC.GroupsClaim == "" {
+		return "groups"
+	}
+	return c.OIDC.GroupsClaim
 }
 
 // Validate performs fail-fast checks so misconfiguration surfaces at startup
@@ -495,6 +565,15 @@ func (c *Config) Validate() error {
 		}
 		if c.Logging.Group == "" {
 			errs = append(errs, "logging.group must not be empty when logging.dir is set")
+		}
+	}
+
+	if c.AuditEnabled() {
+		if c.AuditFilePath() == "" {
+			errs = append(errs, "audit is enabled but no directory is available; set audit.dir or disable it with audit.enabled: false")
+		}
+		if strings.ContainsAny(c.Audit.File, `/\`) {
+			errs = append(errs, "audit.file must be a bare file name without path separators")
 		}
 	}
 

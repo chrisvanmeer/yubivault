@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"yubivault/internal/audit"
 	"yubivault/internal/config"
 	"yubivault/internal/install"
 	"yubivault/internal/portal"
@@ -33,11 +34,34 @@ var (
 func main() {
 	installFlag := flag.Bool("install", false, "Install YubiVault as a systemd service")
 	uninstallFlag := flag.Bool("uninstall", false, "Uninstall the YubiVault systemd service")
+	checkConfigFlag := flag.Bool("check-config", false, "Validate the configuration and its dependencies, then exit")
 	version := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
 
 	if *version {
 		fmt.Println("yubivault")
+		return
+	}
+
+	if *checkConfigFlag {
+		cfg, err := config.Load(envOrDefault("CONFIG_FILE", "config.yaml"))
+		if err != nil {
+			slog.Error("configuration invalid", "error", err)
+			os.Exit(1)
+		}
+		if cfg.AuditEnabled() {
+			logger, err := openAudit(cfg)
+			if err != nil {
+				slog.Error("configuration invalid", "error", err)
+				os.Exit(1)
+			}
+			_ = logger.Close()
+		}
+		if err := portal.Check(cfg, slog.Default()); err != nil {
+			slog.Error("configuration check failed", "error", err)
+			os.Exit(1)
+		}
+		fmt.Println("configuration OK")
 		return
 	}
 
@@ -82,11 +106,18 @@ func run() error {
 	defer closeLog()
 	slog.SetDefault(logger)
 
+	auditLogger, err := openAudit(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = auditLogger.Close() }()
+
 	p, err := portal.New(portal.Options{
 		Config:    cfg,
 		Templates: templateFS,
 		Static:    staticFS,
 		Logger:    slog.Default(),
+		Audit:     auditLogger,
 	})
 	if err != nil {
 		return fmt.Errorf("server initialization error: %w", err)
@@ -181,4 +212,28 @@ func newLogger(cfg *config.Config) (*slog.Logger, func(), error) {
 
 	slog.New(slog.NewTextHandler(os.Stderr, opts)).Info("logging to file", "path", path)
 	return slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, f), opts)), func() { _ = f.Close() }, nil
+}
+
+// openAudit opens the append-only audit trail. The audit log is the security
+// record of the portal, so an enabled but unusable audit destination fails
+// startup (fail-fast) instead of silently dropping security events. A nil
+// logger is returned when audit logging is disabled.
+func openAudit(cfg *config.Config) (*audit.Logger, error) {
+	if !cfg.AuditEnabled() {
+		slog.Info("audit trail disabled")
+		return nil, nil
+	}
+	path := cfg.AuditFilePath()
+	if path == "" {
+		return nil, errors.New("audit trail is enabled but no directory is configured; set audit.dir or disable it with audit.enabled: false")
+	}
+	if err := os.MkdirAll(cfg.AuditDir(), 0o750); err != nil {
+		return nil, fmt.Errorf("failed to create audit directory %s: %w", cfg.AuditDir(), err)
+	}
+	l, err := audit.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open audit log %s: %w", path, err)
+	}
+	slog.Info("audit trail enabled", "path", path)
+	return l, nil
 }

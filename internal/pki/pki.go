@@ -71,6 +71,13 @@ func (s *Service) RevokeExisting() bool { return s.opts.RevokeExisting }
 // StrictRevocation reports whether revocation failures must abort the request.
 func (s *Service) StrictRevocation() bool { return s.opts.RevokeMode == "strict" }
 
+// CheckAppRole validates the configured portal AppRole credentials by
+// performing a login. It is used by --check-config and the readiness probe.
+func (s *Service) CheckAppRole() error {
+	_, err := s.appRoleClient()
+	return err
+}
+
 func (s *Service) newClient() (*vault.Client, error) {
 	return vault.NewClient(s.vaultConfig)
 }

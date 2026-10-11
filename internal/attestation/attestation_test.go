@@ -2,6 +2,9 @@ package attestation
 
 import (
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"math/big"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -112,5 +115,49 @@ func TestLoadRoots(t *testing.T) {
 	}
 	if pool == nil {
 		t.Fatal("expected a non-nil pool")
+	}
+}
+
+func TestDeviceInfo(t *testing.T) {
+	serialDER, err := asn1.Marshal(big.NewInt(12345678))
+	if err != nil {
+		t.Fatalf("marshal serial: %v", err)
+	}
+	fwDER, err := asn1.Marshal([]byte{5, 4, 3})
+	if err != nil {
+		t.Fatalf("marshal firmware: %v", err)
+	}
+
+	cert := &x509.Certificate{
+		Extensions: []pkix.Extension{
+			{Id: yubicoSerialOID, Value: serialDER},
+			{Id: yubicoFirmwareOID, Value: fwDER},
+		},
+	}
+	serial, firmware := DeviceInfo(cert)
+	if serial != "12345678" {
+		t.Errorf("serial = %q, want 12345678", serial)
+	}
+	if firmware != "5.4.3" {
+		t.Errorf("firmware = %q, want 5.4.3", firmware)
+	}
+}
+
+func TestDeviceInfoRawFirmware(t *testing.T) {
+	cert := &x509.Certificate{
+		Extensions: []pkix.Extension{
+			{Id: yubicoFirmwareOID, Value: []byte{5, 4, 3}},
+		},
+	}
+	if _, fw := DeviceInfo(cert); fw != "5.4.3" {
+		t.Errorf("raw firmware = %q, want 5.4.3", fw)
+	}
+}
+
+func TestDeviceInfoMissingExtensions(t *testing.T) {
+	cert := &x509.Certificate{}
+	serial, firmware := DeviceInfo(cert)
+	if serial != "" || firmware != "" {
+		t.Errorf("expected empty device info, got %q / %q", serial, firmware)
 	}
 }

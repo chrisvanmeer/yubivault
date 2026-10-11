@@ -47,6 +47,18 @@
                     <span class="font-semibold text-slate-700 dark:text-slate-300">{{.NotAfter}}</span>
                 </div>
                 {{end}}
+                {{if .YubiKeySerial}}
+                <div class="flex items-center justify-between">
+                    <span class="text-slate-500 dark:text-slate-400">YubiKey serial</span>
+                    <span class="font-mono font-semibold text-slate-700 dark:text-slate-300">{{.YubiKeySerial}}</span>
+                </div>
+                {{end}}
+                {{if .YubiKeyFirmware}}
+                <div class="flex items-center justify-between">
+                    <span class="text-slate-500 dark:text-slate-400">Firmware</span>
+                    <span class="font-semibold text-slate-700 dark:text-slate-300">{{.YubiKeyFirmware}}</span>
+                </div>
+                {{end}}
                 {{if .Issued}}
                 <div class="pt-1.5 border-t border-slate-200 dark:border-slate-700 text-[11px] text-emerald-700 dark:text-emerald-400">
                     {{.Issued}} previous certificate(s) were revoked.

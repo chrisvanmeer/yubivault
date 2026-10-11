@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"regexp"
 	"strings"
@@ -20,6 +21,13 @@ import (
 // yubicoOriginOID is the Yubico key origin prefix: any extension under
 // 1.3.6.1.4.1.41482.3.3.x asserts the key was generated inside a YubiKey.
 var yubicoOriginOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 41482, 3, 3}
+
+// Yubico PIV attestation certificate extensions. The serial number is a DER
+// INTEGER and the firmware version a 3 byte OCTET STRING (major.minor.patch).
+var (
+	yubicoSerialOID   = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 41482, 3, 7}
+	yubicoFirmwareOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 41482, 3, 8}
+)
 
 var (
 	identityRe = regexp.MustCompile(`^[A-Za-z0-9._@+-]{1,254}$`)
@@ -43,6 +51,18 @@ type Verifier struct {
 	roots           *x509.CertPool
 	allowedKeyTypes map[string]bool
 	strictSlotCheck bool
+}
+
+// Result is the outcome of a successful attestation verification.
+type Result struct {
+	// CSR is the parsed, self-signed certificate request.
+	CSR *x509.CertificateRequest
+	// Attestation is the YubiKey attestation certificate.
+	Attestation *x509.Certificate
+	// Serial is the YubiKey serial number, or "" when the extension is absent.
+	Serial string
+	// Firmware is the YubiKey firmware version (major.minor.patch), or "".
+	Firmware string
 }
 
 // New builds a Verifier from the given options.
@@ -132,62 +152,62 @@ func ValidateCN(cn string) error {
 }
 
 // Verify proves that the CSR was produced by a key generated inside a
-// genuine YubiKey PIV slot. It returns the parsed CSR and the attestation
-// certificate for display purposes.
-func (v *Verifier) Verify(csrPEM, attestPEM, intPEM []byte, expectedCN, selectedSlot, selectedKeyType string) (*x509.CertificateRequest, *x509.Certificate, error) {
+// genuine YubiKey PIV slot. It returns the parsed CSR, the attestation
+// certificate and the YubiKey device identity.
+func (v *Verifier) Verify(csrPEM, attestPEM, intPEM []byte, expectedCN, selectedSlot, selectedKeyType string) (*Result, error) {
 	block, _ := pem.Decode(csrPEM)
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
-		return nil, nil, errors.New("invalid CSR PEM format")
+		return nil, errors.New("invalid CSR PEM format")
 	}
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse CSR: %w", err)
+		return nil, fmt.Errorf("failed to parse CSR: %w", err)
 	}
 
 	if err := csr.CheckSignature(); err != nil {
-		return nil, nil, fmt.Errorf("CSR self-signature is invalid: %w", err)
+		return nil, fmt.Errorf("CSR self-signature is invalid: %w", err)
 	}
 
 	if err := ValidateCN(expectedCN); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if csr.Subject.CommonName != expectedCN {
-		return nil, nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"CSR Common Name '%s' does not match the required Common Name '%s'",
 			csr.Subject.CommonName, expectedCN)
 	}
 
 	keyType, err := PublicKeyType(csr.PublicKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if !v.allowedKeyTypes[keyType] {
-		return nil, nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"key type '%s' is not enabled by the administrator (allowed: %s)",
 			keyType, strings.Join(v.sortedAllowed(), ", "))
 	}
 	if selectedKeyType != "" && selectedKeyType != keyType {
-		return nil, nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"selected key type '%s' does not match the attested key type '%s'",
 			selectedKeyType, keyType)
 	}
 
 	block, _ = pem.Decode(attestPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, nil, errors.New("invalid attestation certificate PEM format")
+		return nil, errors.New("invalid attestation certificate PEM format")
 	}
 	attestCert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse attestation certificate: %w", err)
+		return nil, fmt.Errorf("failed to parse attestation certificate: %w", err)
 	}
 
 	block, _ = pem.Decode(intPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, nil, errors.New("invalid intermediate certificate PEM format")
+		return nil, errors.New("invalid intermediate certificate PEM format")
 	}
 	intCert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse intermediate certificate: %w", err)
+		return nil, fmt.Errorf("failed to parse intermediate certificate: %w", err)
 	}
 
 	intermediates := x509.NewCertPool()
@@ -199,31 +219,37 @@ func (v *Verifier) Verify(csrPEM, attestPEM, intPEM []byte, expectedCN, selected
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}
 	if _, err := attestCert.Verify(opts); err != nil {
-		return nil, nil, fmt.Errorf("attestation chain verification failed against Yubico Root CA: %w", err)
+		return nil, fmt.Errorf("attestation chain verification failed against Yubico Root CA: %w", err)
 	}
 
 	csrPubDER, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode CSR public key: %w", err)
+		return nil, fmt.Errorf("failed to encode CSR public key: %w", err)
 	}
 	attestPubDER, err := x509.MarshalPKIXPublicKey(attestCert.PublicKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode attestation public key: %w", err)
+		return nil, fmt.Errorf("failed to encode attestation public key: %w", err)
 	}
 	if !bytes.Equal(csrPubDER, attestPubDER) {
-		return nil, nil, errors.New("CSR public key does not match hardware attestation public key")
+		return nil, errors.New("CSR public key does not match hardware attestation public key")
 	}
 
 	if err := v.verifySlot(attestCert, selectedSlot); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if !HasYubicoOriginOID(attestCert) {
-		return nil, nil, errors.New(
+		return nil, errors.New(
 			"key lacks Yubico hardware origin OIDs; the key must be generated inside the YubiKey")
 	}
 
-	return csr, attestCert, nil
+	serial, firmware := DeviceInfo(attestCert)
+	return &Result{
+		CSR:         csr,
+		Attestation: attestCert,
+		Serial:      serial,
+		Firmware:    firmware,
+	}, nil
 }
 
 // verifySlot ensures the attestation statement was created for the PIV slot
@@ -258,6 +284,38 @@ func HasYubicoOriginOID(cert *x509.Certificate) bool {
 		}
 	}
 	return false
+}
+
+// DeviceInfo extracts the YubiKey serial number and firmware version from the
+// Yubico attestation certificate extensions. Both are optional: an empty
+// string is returned when the extension is absent or malformed.
+func DeviceInfo(cert *x509.Certificate) (serial, firmware string) {
+	for _, ext := range cert.Extensions {
+		switch {
+		case ext.Id.Equal(yubicoSerialOID):
+			var n *big.Int
+			if _, err := asn1.Unmarshal(ext.Value, &n); err == nil && n != nil {
+				serial = n.String()
+			}
+		case ext.Id.Equal(yubicoFirmwareOID):
+			firmware = parseFirmware(ext.Value)
+		}
+	}
+	return serial, firmware
+}
+
+// parseFirmware decodes the 3 byte firmware version extension
+// (major.minor.patch). Some encoders wrap the bytes in an OCTET STRING and
+// others store them raw, so both forms are accepted.
+func parseFirmware(value []byte) string {
+	var raw []byte
+	if _, err := asn1.Unmarshal(value, &raw); err != nil || len(raw) < 3 {
+		raw = value
+	}
+	if len(raw) < 3 {
+		return ""
+	}
+	return fmt.Sprintf("%d.%d.%d", raw[0], raw[1], raw[2])
 }
 
 // PublicKeyType maps a public key to a configured key type name.

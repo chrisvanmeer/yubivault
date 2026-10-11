@@ -25,6 +25,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"yubivault/internal/attestation"
+	"yubivault/internal/audit"
 	"yubivault/internal/config"
 	"yubivault/internal/pki"
 )
@@ -34,6 +35,7 @@ const (
 	sessionName     = "yubivault_session"
 	sessionMaxAge   = 3600
 	oidcTimeout     = 15 * time.Second
+	oidcReadyTTL    = 60 * time.Second
 	limiterSweepAge = 10 * time.Minute
 )
 
@@ -45,6 +47,9 @@ type Options struct {
 	Templates fs.FS
 	// Static contains the embedded project root FS, including static/.
 	Static fs.FS
+	// Audit is the audit trail logger. It may be nil when audit logging is
+	// disabled; Log calls on nil loggers are no-ops.
+	Audit  *audit.Logger
 	Logger *slog.Logger
 }
 
@@ -62,6 +67,10 @@ type Portal struct {
 	endSessionURL string
 	loginLimiter  *ipLimiter
 	signLimiter   *ipLimiter
+	audit         *audit.Logger
+	oidcMu        sync.Mutex
+	oidcCheckAt   time.Time
+	oidcCheckErr  error
 }
 
 // New builds a fully wired Portal. It fails fast on configuration or
@@ -90,20 +99,7 @@ func New(opts Options) (*Portal, error) {
 		return nil, err
 	}
 
-	pkiSvc, err := pki.New(pki.Options{
-		Address:         cfg.Vault.Address,
-		PKIMount:        cfg.Vault.PKIMount,
-		PKIRole:         cfg.Vault.PKIRole,
-		AuthMount:       cfg.Vault.AuthMount,
-		AuthRole:        cfg.Vault.AuthRole,
-		AppRoleMount:    cfg.Vault.AppRoleMount,
-		AppRoleRoleID:   cfg.Vault.AppRoleRoleID,
-		AppRoleSecretID: cfg.Vault.AppRoleSecretID,
-		RevokeExisting:  cfg.Vault.RevokeExisting,
-		RevokeMode:      cfg.Vault.RevokeMode,
-		CertTTL:         cfg.Vault.CertTTL,
-		CertTTLMax:      cfg.Vault.CertTTLMax,
-	})
+	pkiSvc, err := pki.New(pkiOptions(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +159,76 @@ func New(opts Options) (*Portal, error) {
 		endSessionURL: discoverEndSessionEndpoint(ctx, cfg.OIDC.Issuer),
 		loginLimiter:  newIPLimiter(cfg.RateLimitLogin(), cfg.RateLimitLogin()),
 		signLimiter:   newIPLimiter(cfg.RateLimitSign(), cfg.RateLimitSign()),
+		audit:         opts.Audit,
 	}, nil
+}
+
+// pkiOptions maps the shared Vault configuration to the PKI service options.
+// It is used both by New and --check-config.
+func pkiOptions(cfg *config.Config) pki.Options {
+	return pki.Options{
+		Address:         cfg.Vault.Address,
+		PKIMount:        cfg.Vault.PKIMount,
+		PKIRole:         cfg.Vault.PKIRole,
+		AuthMount:       cfg.Vault.AuthMount,
+		AuthRole:        cfg.Vault.AuthRole,
+		AppRoleMount:    cfg.Vault.AppRoleMount,
+		AppRoleRoleID:   cfg.Vault.AppRoleRoleID,
+		AppRoleSecretID: cfg.Vault.AppRoleSecretID,
+		RevokeExisting:  cfg.Vault.RevokeExisting,
+		RevokeMode:      cfg.Vault.RevokeMode,
+		CertTTL:         cfg.Vault.CertTTL,
+		CertTTLMax:      cfg.Vault.CertTTLMax,
+	}
+}
+
+// Check validates the runtime dependencies of the configuration without
+// starting the server. It is used by the --check-config CLI flag.
+func Check(cfg *config.Config, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	var errs []string
+	record := func(what string, err error) {
+		if err == nil {
+			logger.Info("check ok", "check", what)
+			return
+		}
+		logger.Error("check failed", "check", what, "error", err)
+		errs = append(errs, fmt.Sprintf("%s: %v", what, err))
+	}
+
+	roots, err := attestation.LoadRoots(cfg.Yubico.RootCAFile)
+	if err != nil {
+		record("yubico roots", err)
+	} else if _, err := attestation.New(attestation.Options{
+		Roots:           roots,
+		AllowedKeyTypes: cfg.AllowedKeyTypes(),
+		StrictSlotCheck: cfg.StrictSlotCheck(),
+	}); err != nil {
+		record("attestation verifier", err)
+	}
+
+	pkiSvc, err := pki.New(pkiOptions(cfg))
+	if err != nil {
+		record("vault service", err)
+	} else {
+		record("vault", pkiSvc.Healthy())
+		if cfg.Vault.RevokeExisting {
+			record("vault approle", pkiSvc.CheckAppRole())
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), oidcTimeout)
+	defer cancel()
+	if _, err := oidc.NewProvider(ctx, cfg.OIDC.Issuer); err != nil {
+		record("oidc discovery", err)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // Handler returns the complete route table wrapped in the middleware chain.
@@ -177,14 +242,14 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("/callback", p.handleCallback)
 	mux.HandleFunc("/logout", p.handleLogout)
 	if p.config.CertificatesEnabled() {
-		mux.HandleFunc("/certs", p.requireAuth(p.handleInventory))
+		mux.HandleFunc("/certs", p.requireAuth(p.requireMember(p.handleInventory)))
 	}
 
-	mux.HandleFunc("/manual/raw", p.requireAuth(p.handleManualRaw))
-	mux.HandleFunc("/manual/asset/", p.requireAuth(p.handleManualAsset))
+	mux.HandleFunc("/manual/raw", p.requireAuth(p.requireMember(p.handleManualRaw)))
+	mux.HandleFunc("/manual/asset/", p.requireAuth(p.requireMember(p.handleManualAsset)))
 
-	mux.HandleFunc("/api/sign-csr", p.requireAuth(p.rateLimit(p.signLimiter, p.handleSignCSR)))
-	mux.HandleFunc("/api/active-cert", p.requireAuth(p.handleActiveCert))
+	mux.HandleFunc("/api/sign-csr", p.requireAuth(p.requireMember(p.rateLimit(p.signLimiter, p.handleSignCSR))))
+	mux.HandleFunc("/api/active-cert", p.requireAuth(p.requireMember(p.handleActiveCert)))
 
 	mux.HandleFunc("/healthz", p.handleHealthz)
 	mux.HandleFunc("/readyz", p.handleReadyz)
@@ -462,6 +527,31 @@ var sessionExpiredTemplate = template.Must(template.New("session-expired").Parse
 		<h3 class="font-bold text-base mb-1">Session expired</h3>
 		<p class="text-xs mb-3">Your login session has ended. Log in again to continue.</p>
 		<a href="/login" class="inline-flex items-center px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition shadow-sm">Log in again</a>
+	</div>`))
+
+// requireMember rejects authenticated users that are not members of one of
+// the configured allowed groups. When no groups are configured every
+// authenticated user passes.
+func (p *Portal) requireMember(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !p.isMember(r) {
+			identity, _ := p.sessionIdentity(r)
+			p.audit.Log(audit.Event{Event: audit.EventIssueDenied, Outcome: audit.OutcomeDenied,
+				Reason: "not a member of an allowed group", Identity: identity, RemoteIP: clientIP(r)})
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_ = notMemberTemplate.Execute(w, nil)
+			return
+		}
+		next(w, r)
+	}
+}
+
+var notMemberTemplate = template.Must(template.New("not-member").Parse(
+	`<div class="animate-slide-up p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700/60 text-amber-900 dark:text-amber-200 rounded-xl shadow-sm">
+		<h3 class="font-bold text-base mb-1">Access restricted</h3>
+		<p class="text-xs mb-3">Your account is not a member of a group allowed to issue certificates. Contact your administrator.</p>
+		<a href="/logout" class="inline-flex items-center px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition shadow-sm">Log out</a>
 	</div>`))
 
 func (p *Portal) rateLimit(limiter *ipLimiter, next http.HandlerFunc) http.HandlerFunc {

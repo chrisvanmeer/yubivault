@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gorilla/sessions"
+
 	"yubivault/internal/config"
 )
 
@@ -276,5 +278,179 @@ func TestIPLimiter(t *testing.T) {
 	}
 	if !lim.allow("2.2.2.2") {
 		t.Fatal("different IP should have its own bucket")
+	}
+}
+
+func TestParseGroups(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want []string
+	}{
+		{"array", []any{"a", "b", "c"}, []string{"a", "b", "c"}},
+		{"string slice", []string{"x", "y"}, []string{"x", "y"}},
+		{"delimited string", "g1, g2 g3", []string{"g1", "g2", "g3"}},
+		{"empty array", []any{}, nil},
+		{"nil", nil, nil},
+		{"non string", 42, nil},
+	}
+	for _, tc := range cases {
+		if got := parseGroups(tc.in); !equalStrings(got, tc.want) {
+			t.Errorf("%s: parseGroups(%v) = %v, want %v", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestClaimPath(t *testing.T) {
+	claims := map[string]any{
+		"groups": []any{"devs"},
+		"resource_access": map[string]any{
+			"Vault": map[string]any{
+				"roles": []any{"testers"},
+			},
+		},
+		"email": "chris@example.com",
+	}
+	if got, ok := claimPath(claims, "groups").([]any); !ok || len(got) != 1 {
+		t.Errorf("top-level claim = %v", got)
+	}
+	if got, ok := claimPath(claims, "resource_access.Vault.roles").([]any); !ok || len(got) != 1 {
+		t.Errorf("nested claim = %v", got)
+	}
+	if got := claimPath(claims, "resource_access.Other.roles"); got != nil {
+		t.Errorf("missing nested claim = %v, want nil", got)
+	}
+	if got := claimPath(claims, "groups.roles"); got != nil {
+		t.Errorf("intermediate non-map = %v, want nil", got)
+	}
+	if got := stringClaim(claims, "email"); got != "chris@example.com" {
+		t.Errorf("stringClaim = %q", got)
+	}
+	if got := stringClaim(claims, "preferred_username"); got != "" {
+		t.Errorf("stringClaim missing = %q, want empty", got)
+	}
+}
+
+func TestMemberOfAny(t *testing.T) {
+	if !memberOfAny([]string{"Testers"}, []string{"testers"}) {
+		t.Error("case-insensitive match should succeed")
+	}
+	if memberOfAny([]string{"testers"}, nil) {
+		t.Error("empty allowlist should not match; the caller short-circuits it")
+	}
+	if memberOfAny(nil, []string{"testers"}) {
+		t.Error("no groups should not match a non-empty allowlist")
+	}
+	if memberOfAny([]string{"devs"}, []string{"testers"}) {
+		t.Error("non-matching groups should be rejected")
+	}
+}
+
+func TestLoginErrorMessage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	if got := loginErrorMessage(req); got != "" {
+		t.Errorf("no error param = %q, want empty", got)
+	}
+
+	denied := httptest.NewRequest(http.MethodGet, "http://portal/?error=access_denied", nil)
+	if got := loginErrorMessage(denied); !strings.Contains(got, "not a member") {
+		t.Errorf("access_denied message = %q", got)
+	}
+
+	unknown := httptest.NewRequest(http.MethodGet, "http://portal/?error=whatever", nil)
+	if got := loginErrorMessage(unknown); got == "" {
+		t.Error("unknown error should get a generic message")
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		if (len(a) == 0 && b == nil) || (a == nil && len(b) == 0) {
+			return true
+		}
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func newSessionPortal() *Portal {
+	return &Portal{
+		config:      &config.Config{},
+		cookieStore: sessions.NewCookieStore([]byte(strings.Repeat("h", 64)), []byte(strings.Repeat("b", 32))),
+		logger:      slog.Default(),
+	}
+}
+
+// seedSession writes session values into req and attaches the resulting cookie
+// so a subsequent session lookup in the same request sees them.
+func seedSession(t *testing.T, p *Portal, req *http.Request, values map[string]any) {
+	t.Helper()
+	sess, err := p.cookieStore.Get(req, sessionName)
+	if err != nil {
+		t.Fatalf("session lookup failed: %v", err)
+	}
+	for k, v := range values {
+		sess.Values[k] = v
+	}
+	rec := httptest.NewRecorder()
+	if err := sess.Save(req, rec); err != nil {
+		t.Fatalf("session save failed: %v", err)
+	}
+	cookie := rec.Header().Get("Set-Cookie")
+	req.Header.Set("Cookie", strings.SplitN(cookie, ";", 2)[0])
+}
+
+func TestIsMember(t *testing.T) {
+	p := newSessionPortal()
+	req := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	if !p.isMember(req) {
+		t.Error("empty allowlist should make everyone a member")
+	}
+
+	p.config.OIDC.AllowedGroups = []string{"yubivault-users"}
+
+	memberReq := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	seedSession(t, p, memberReq, map[string]any{"user_groups": []string{"Yubivault-Users"}})
+	if !p.isMember(memberReq) {
+		t.Error("group match should be case-insensitive")
+	}
+
+	nonMember := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	if p.isMember(nonMember) {
+		t.Error("user without groups should not be a member when an allowlist is set")
+	}
+
+	other := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	seedSession(t, p, other, map[string]any{"user_groups": []string{"devs"}})
+	if p.isMember(other) {
+		t.Error("non-matching group should be rejected")
+	}
+}
+
+func TestRequireMember(t *testing.T) {
+	p := newSessionPortal()
+	p.config.OIDC.AllowedGroups = []string{"yubivault-users"}
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	handler := p.requireMember(ok)
+
+	nonMember := httptest.NewRequest(http.MethodGet, "http://portal/api/sign-csr", nil)
+	seedSession(t, p, nonMember, map[string]any{"user_groups": []string{"devs"}})
+	rec := httptest.NewRecorder()
+	handler(rec, nonMember)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("non-member should get 403, got %d", rec.Code)
+	}
+
+	member := httptest.NewRequest(http.MethodGet, "http://portal/api/sign-csr", nil)
+	seedSession(t, p, member, map[string]any{"user_groups": []string{"yubivault-users"}})
+	rec = httptest.NewRecorder()
+	handler(rec, member)
+	if rec.Code != http.StatusOK {
+		t.Errorf("member should pass, got %d", rec.Code)
 	}
 }

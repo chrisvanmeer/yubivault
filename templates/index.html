@@ -351,6 +351,14 @@
     <main class="flex-1 animate-fade-in">
         <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
 
+            {{if and .IsLoggedIn (not .IsMember)}}
+            <!-- ACCESS RESTRICTED -->
+            <div class="mb-8 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700/60 text-amber-900 dark:text-amber-200 rounded-xl shadow-sm">
+                <h2 class="font-bold text-sm mb-1">Access restricted</h2>
+                <p class="text-xs">Your account is not a member of a group allowed to issue certificates. Contact your administrator.</p>
+            </div>
+            {{end}}
+
             <!-- HERO -->
             <div class="mb-8">
                 <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 text-[11px] font-bold text-blue-700 dark:text-blue-300 uppercase tracking-wide mb-3">
@@ -605,7 +613,12 @@ ykman piv certificates export f9 intermediate.crt</pre>
 
     {{else}}
     <!-- LOGIN -->
-    <main class="flex-1 flex items-center justify-center p-6 animate-fade-in">
+    <main class="flex-1 flex flex-col items-center justify-center p-6 animate-fade-in">
+        {{if .LoginError}}
+        <div class="w-full max-w-sm mb-4 px-4 py-3 rounded-xl bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300 text-center">
+            {{.LoginError}}
+        </div>
+        {{end}}
         <div class="login-card w-full max-w-sm text-center">
             <span class="logo-chip logo-chip-lg mx-auto">
                 <svg class="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">

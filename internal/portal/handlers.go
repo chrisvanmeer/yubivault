@@ -2,6 +2,7 @@ package portal
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/yuin/goldmark"
@@ -21,6 +23,7 @@ import (
 	"github.com/yuin/goldmark/util"
 
 	"yubivault/internal/attestation"
+	"yubivault/internal/audit"
 	"yubivault/internal/config"
 	"yubivault/internal/pki"
 )
@@ -28,14 +31,16 @@ import (
 // issuedCert holds the properties of a freshly signed certificate shown in
 // the success modal.
 type issuedCert struct {
-	CertPEM  string
-	Serial   string
-	CN       string
-	Slot     string
-	KeyType  string
-	NotAfter string
-	Issued   int
-	Warnings []string
+	CertPEM         string
+	Serial          string
+	CN              string
+	Slot            string
+	KeyType         string
+	NotAfter        string
+	Issued          int
+	Warnings        []string
+	YubiKeySerial   string
+	YubiKeyFirmware string
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +65,8 @@ func (p *Portal) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	data := map[string]any{
 		"IsLoggedIn":          isLoggedIn,
+		"IsMember":            p.isMember(r),
+		"LoginError":          loginErrorMessage(r),
 		"UserIdentity":        identity,
 		"CertCN":              cn,
 		"CNEditable":          p.config.AllowCNOverride(),
@@ -82,14 +89,30 @@ func (p *Portal) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-func (p *Portal) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+func (p *Portal) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	checks := map[string]string{"vault": "ok"}
 	ready := true
+
 	if err := p.pki.Healthy(); err != nil {
 		checks["vault"] = err.Error()
 		ready = false
 	}
+	if p.config.Vault.RevokeExisting {
+		if err := p.pki.CheckAppRole(); err != nil {
+			checks["approle"] = err.Error()
+			ready = false
+		} else {
+			checks["approle"] = "ok"
+		}
+	}
+	if err := p.checkOIDC(r.Context()); err != nil {
+		checks["oidc"] = err.Error()
+		ready = false
+	} else {
+		checks["oidc"] = "ok"
+	}
+
 	if !ready {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
@@ -97,6 +120,28 @@ func (p *Portal) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 		"status": map[bool]string{true: "ready", false: "unavailable"}[ready],
 		"checks": checks,
 	})
+}
+
+// checkOIDC re-runs the OIDC discovery to detect provider degradation. The
+// result is cached for a short window so readiness probes do not hammer the
+// identity provider.
+func (p *Portal) checkOIDC(ctx context.Context) error {
+	p.oidcMu.Lock()
+	defer p.oidcMu.Unlock()
+	if time.Since(p.oidcCheckAt) < oidcReadyTTL {
+		return p.oidcCheckErr
+	}
+	p.oidcCheckAt = time.Now()
+	ctx, cancel := context.WithTimeout(ctx, oidcTimeout)
+	defer cancel()
+	prov, err := oidc.NewProvider(ctx, p.config.OIDC.Issuer)
+	if err != nil {
+		p.oidcCheckErr = err
+		return err
+	}
+	_ = prov
+	p.oidcCheckErr = nil
+	return nil
 }
 
 func (p *Portal) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -165,31 +210,49 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var claims struct {
-		Email             string `json:"email"`
-		PreferredUsername string `json:"preferred_username"`
-	}
+	var claims map[string]any
 	_ = idToken.Claims(&claims)
 
-	identity := claims.PreferredUsername
+	email := stringClaim(claims, "email")
+	identity := stringClaim(claims, "preferred_username")
 	if identity == "" {
-		identity = claims.Email
+		identity = email
 	}
+	groups := parseGroups(claimPath(claims, p.config.GroupsClaim()))
+
+	if allowed := p.config.AllowedGroups(); len(allowed) > 0 && !memberOfAny(groups, allowed) {
+		p.logger.Warn("rejected login: not a member of an allowed group",
+			"identity", identity, "groups", groups)
+		p.audit.Log(audit.Event{Event: audit.EventLoginDenied, Outcome: audit.OutcomeDenied,
+			Reason: "not a member of an allowed group", Identity: identity, RemoteIP: clientIP(r)})
+		delete(session.Values, "oauth_state")
+		delete(session.Values, "oauth_nonce")
+		_ = session.Save(r, w)
+		http.Redirect(w, r, "/?error=access_denied", http.StatusSeeOther)
+		return
+	}
+
 	if err := attestation.ValidateIdentity(identity); err != nil {
 		p.logger.Warn("rejected login due to unusable identity", "identity", identity, "error", err)
+		p.audit.Log(audit.Event{Event: audit.EventLoginDenied, Outcome: audit.OutcomeDenied,
+			Reason: "unusable identity", Identity: identity, RemoteIP: clientIP(r)})
 		renderError(w, http.StatusForbidden,
 			"Your account name cannot be used as a certificate Common Name. Contact your administrator.")
 		return
 	}
-	if _, err := p.certCN(identity, claims.Email); err != nil {
+	cn, err := p.certCN(identity, email)
+	if err != nil {
 		p.logger.Warn("rejected login due to unusable Common Name", "identity", identity, "error", err)
+		p.audit.Log(audit.Event{Event: audit.EventLoginDenied, Outcome: audit.OutcomeDenied,
+			Reason: "unusable common name", Identity: identity, RemoteIP: clientIP(r)})
 		renderError(w, http.StatusForbidden,
 			"Your account name cannot be used as a certificate Common Name. Contact your administrator.")
 		return
 	}
 
 	session.Values["user_identity"] = identity
-	session.Values["user_email"] = claims.Email
+	session.Values["user_email"] = email
+	session.Values["user_groups"] = groups
 	session.Values["raw_id_token"] = rawIDToken
 	delete(session.Values, "oauth_state")
 	delete(session.Values, "oauth_nonce")
@@ -198,6 +261,9 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p.audit.Log(audit.Event{Event: audit.EventLogin, Outcome: audit.OutcomeSuccess,
+		Identity: identity, CN: cn, RemoteIP: clientIP(r)})
+
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -205,12 +271,16 @@ func (p *Portal) handleLogout(w http.ResponseWriter, r *http.Request) {
 	session, err := p.cookieStore.Get(r, sessionName)
 	if err == nil {
 		rawIDToken, _ := session.Values["raw_id_token"].(string)
+		identity, _ := session.Values["user_identity"].(string)
 		delete(session.Values, "user_identity")
+		delete(session.Values, "user_groups")
 		delete(session.Values, "raw_id_token")
 		delete(session.Values, "oauth_state")
 		delete(session.Values, "oauth_nonce")
 		session.Options.MaxAge = -1
 		_ = session.Save(r, w)
+		p.audit.Log(audit.Event{Event: audit.EventLogout, Outcome: audit.OutcomeSuccess,
+			Identity: identity, RemoteIP: clientIP(r)})
 
 		// RP-initiated logout at the identity provider when configured.
 		if p.endSessionURL != "" && p.config.OIDC.LogoutRedirectURI != "" {
@@ -301,10 +371,20 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	csr, _, err := p.attest.Verify(csrPEM, attestPEM, intPEM, cn, selectedSlot, selectedKeyType)
+	result, err := p.attest.Verify(csrPEM, attestPEM, intPEM, cn, selectedSlot, selectedKeyType)
 	if err != nil {
 		p.logger.Warn("attestation rejected",
 			"identity", identity, "slot", selectedSlot, "key_type", selectedKeyType, "error", err)
+		p.audit.Log(audit.Event{
+			Event:    audit.EventIssueDenied,
+			Outcome:  audit.OutcomeDenied,
+			Reason:   err.Error(),
+			Identity: identity,
+			CN:       cn,
+			Slot:     selectedSlot,
+			KeyType:  selectedKeyType,
+			RemoteIP: clientIP(r),
+		})
 		renderError(w, http.StatusBadRequest, fmt.Sprintf("Attestation verification failed: %v", err))
 		return
 	}
@@ -344,12 +424,14 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issued := issuedCert{
-		CertPEM: certPEM,
-		Serial:  serial,
-		CN:      csr.Subject.CommonName,
-		Slot:    selectedSlot,
-		KeyType: selectedKeyType,
-		Issued:  len(pendingRevocations),
+		CertPEM:         certPEM,
+		Serial:          serial,
+		CN:              result.CSR.Subject.CommonName,
+		Slot:            selectedSlot,
+		KeyType:         selectedKeyType,
+		Issued:          len(pendingRevocations),
+		YubiKeySerial:   result.Serial,
+		YubiKeyFirmware: result.Firmware,
 	}
 	if parsed, err := pki.ParseCertificate(certPEM); err == nil {
 		issued.NotAfter = parsed.NotAfter.UTC().Format("2006-01-02 15:04 UTC")
@@ -376,8 +458,30 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 			issued.Warnings = append(issued.Warnings,
 				fmt.Sprintf("The new certificate was issued, but %d previous certificate(s) could not be revoked. Revoke them manually in Vault.",
 					len(toRevoke)))
+		} else {
+			p.audit.Log(audit.Event{
+				Event:    audit.EventRevoke,
+				Outcome:  audit.OutcomeSuccess,
+				Identity: identity,
+				CN:       cn,
+				Reason:   fmt.Sprintf("revoked %d superseded certificate(s)", len(toRevoke)),
+				RemoteIP: clientIP(r),
+			})
 		}
 	}
+
+	p.audit.Log(audit.Event{
+		Event:           audit.EventIssue,
+		Outcome:         audit.OutcomeSuccess,
+		Identity:        identity,
+		CN:              cn,
+		Serial:          serial,
+		Slot:            selectedSlot,
+		KeyType:         selectedKeyType,
+		YubiKeySerial:   result.Serial,
+		YubiKeyFirmware: result.Firmware,
+		RemoteIP:        clientIP(r),
+	})
 
 	p.renderTemplate(w, "cert_modal.html", issued)
 }
@@ -772,4 +876,104 @@ func isAllowedKeyType(cfg *config.Config, keyType string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Claim & group helpers
+// ---------------------------------------------------------------------------
+
+// claimPath reads a claim from an OIDC ID token claim map, following the
+// dotted path of key (e.g. "resource_access.Vault.roles" walks into nested
+// claim objects).
+func claimPath(claims map[string]any, key string) any {
+	var cur any = claims
+	for _, part := range strings.Split(key, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur, ok = m[part]
+		if !ok {
+			return nil
+		}
+	}
+	return cur
+}
+
+// stringClaim reads a string claim from an OIDC ID token claim map.
+func stringClaim(claims map[string]any, key string) string {
+	if v, ok := claimPath(claims, key).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// parseGroups converts an OIDC groups claim into a slice of group names. The
+// claim may be delivered as an array of strings or as a single delimited
+// string; any other shape is ignored.
+func parseGroups(v any) []string {
+	switch t := v.(type) {
+	case string:
+		return strings.FieldsFunc(t, func(r rune) bool { return r == ',' || r == ' ' })
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return t
+	}
+	return nil
+}
+
+// sessionGroups returns the OIDC group memberships stored in the session.
+func (p *Portal) sessionGroups(r *http.Request) (bool, []string) {
+	session, err := p.cookieStore.Get(r, sessionName)
+	if err != nil {
+		return false, nil
+	}
+	groups, _ := session.Values["user_groups"].([]string)
+	return true, groups
+}
+
+// isMember reports whether the session holder is a member of one of the
+// configured allowed groups. When no groups are configured, everyone is a
+// member (backward compatible).
+func (p *Portal) isMember(r *http.Request) bool {
+	allowed := p.config.AllowedGroups()
+	if len(allowed) == 0 {
+		return true
+	}
+	_, groups := p.sessionGroups(r)
+	return memberOfAny(groups, allowed)
+}
+
+// memberOfAny reports whether the passed groups overlap with the allowed list,
+// compared case-insensitively after trimming whitespace.
+func memberOfAny(groups, allowed []string) bool {
+	for _, a := range allowed {
+		for _, g := range groups {
+			if strings.EqualFold(strings.TrimSpace(g), strings.TrimSpace(a)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// loginErrorMessage maps the error query parameter to a user-facing message.
+func loginErrorMessage(r *http.Request) string {
+	switch err := r.URL.Query().Get("error"); err {
+	case "":
+		return ""
+	case "access_denied":
+		return "Access denied: your account is not a member of a group allowed to issue certificates. Contact your administrator."
+	case "session_expired":
+		return "Your session has expired. Please log in again."
+	default:
+		return "Login failed. Please try again."
+	}
 }

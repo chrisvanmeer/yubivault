@@ -78,6 +78,14 @@ oidc:
   # redirect URI registered at your IdP exactly.
   redirect_url: "https://yubivault.example.com/callback"
   # logout_redirect_uri: "https://yubivault.example.com/"  # optional, requires IdP support
+  # Optional: restrict certificate issuance (and the certificate inventory and
+  # manual pages) to OIDC users holding at least one of these groups. The group
+  # list is matched case-insensitively. Empty means every authenticated user.
+  # allowed_groups: ["yubivault-users"]
+  # groups_claim: "groups"  # ID token claim holding the memberships (string or array)
+  #   When the memberships live in a nested claim, use a dotted path, e.g. a
+  #   Keycloak client scope mapping to resource_access.Vault.roles:
+  #   groups_claim: "resource_access.Vault.roles"
 
 yubico:
   # PEM bundle with the Yubico PIV root CAs. Fails closed if missing or empty.
@@ -88,6 +96,19 @@ yubico:
   # strict_slot_check: true -> defaults to true. Requires the attestation
   #   subject to name the PIV slot the user selected.
   # rsa_bits: 3072  # legacy single-type setting, superseded by key_types
+
+audit:
+  # Append-only JSONL audit trail of logins, certificate issuance, denials and
+  # revocations. Intended for compliance and incident review; it never contains
+  # ID tokens or session secrets. Enabled by default.
+  # enabled: true
+  # Directory of the audit log. Defaults to logging.dir. When file logging is
+  # disabled (logging.dir: "") this must be set explicitly, otherwise startup
+  # fails: an enabled audit log must be writable.
+  # dir: "/var/log/yubivault"
+  # file: "audit.log"
+  # `yubivault --install` creates the audit file, assigns it to the service
+  # account and the logrotate snippet also rotates audit.log.
 
 logging:
   # Directory for log files. Defaults to /var/log/yubivault. Set to "" to log

@@ -382,3 +382,84 @@ func TestValidateCNPattern(t *testing.T) {
 		t.Errorf("expected cn.pattern compile error, got %v", err)
 	}
 }
+
+func TestAuditDefaults(t *testing.T) {
+	c := validConfig(t)
+	if !c.AuditEnabled() {
+		t.Error("audit should be enabled by default")
+	}
+	if got := c.AuditDir(); got != defaultLogDir {
+		t.Errorf("AuditDir() = %q, want %q", got, defaultLogDir)
+	}
+	if got := c.AuditFilePath(); got != filepath.Join(defaultLogDir, "audit.log") {
+		t.Errorf("AuditFilePath() = %q, want %q", got, filepath.Join(defaultLogDir, "audit.log"))
+	}
+
+	c.Audit.File = "audit.json"
+	if got := c.AuditFilePath(); got != filepath.Join(defaultLogDir, "audit.json") {
+		t.Errorf("AuditFilePath() = %q, want %q", got, filepath.Join(defaultLogDir, "audit.json"))
+	}
+
+	disabled := false
+	c.Audit.Enabled = &disabled
+	if c.AuditEnabled() {
+		t.Error("audit should be disabled when configured")
+	}
+}
+
+func TestAuditDirFollowsLoggingDir(t *testing.T) {
+	c := validConfig(t)
+	empty := ""
+	c.Logging.Dir = &empty
+	if got := c.AuditFilePath(); got != "" {
+		t.Errorf("AuditFilePath() = %q, want empty when both dirs are unset", got)
+	}
+
+	custom := "/srv/audit"
+	c.Audit.Dir = &custom
+	if got := c.AuditFilePath(); got != filepath.Join(custom, "audit.log") {
+		t.Errorf("AuditFilePath() = %q, want %q", got, filepath.Join(custom, "audit.log"))
+	}
+}
+
+func TestValidateAuditRequiresDir(t *testing.T) {
+	c := validConfig(t)
+	empty := ""
+	c.Logging.Dir = &empty
+	c.Audit.Dir = nil
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "audit") {
+		t.Errorf("expected audit directory requirement error, got %v", err)
+	}
+
+	c.Audit.File = "logs/audit.log"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "audit.file") {
+		t.Errorf("expected audit.file separator error, got %v", err)
+	}
+
+	disabled := false
+	c.Audit.Enabled = &disabled
+	if err := c.Validate(); err != nil {
+		t.Errorf("disabled audit should validate cleanly: %v", err)
+	}
+}
+
+func TestGroupsAccessors(t *testing.T) {
+	c := validConfig(t)
+	if got := c.GroupsClaim(); got != "groups" {
+		t.Errorf("default groups_claim = %q, want groups", got)
+	}
+	if len(c.AllowedGroups()) != 0 {
+		t.Error("allowed_groups should default to empty")
+	}
+
+	c.OIDC.GroupsClaim = "roles"
+	c.OIDC.AllowedGroups = []string{" A ", "", "B"}
+	c.applyDefaults()
+	if got := c.GroupsClaim(); got != "roles" {
+		t.Errorf("groups_claim = %q, want roles", got)
+	}
+	groups := c.AllowedGroups()
+	if len(groups) != 2 || groups[0] != "A" || groups[1] != "B" {
+		t.Errorf("allowed_groups should be trimmed with empty entries dropped: %v", groups)
+	}
+}
