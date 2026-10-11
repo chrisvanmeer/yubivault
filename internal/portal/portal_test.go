@@ -16,6 +16,38 @@ func testPortal() *Portal {
 	return &Portal{logger: slog.Default()}
 }
 
+func TestCertCN(t *testing.T) {
+	p := &Portal{
+		logger: slog.Default(),
+		config: &config.Config{},
+	}
+	p.config.CN.Template = "{user}"
+	p.config.CN.Pattern = config.DefaultCNPattern
+
+	got, err := p.certCN("Chris@Example.com", "Chris@Example.com")
+	if err != nil {
+		t.Fatalf("certCN returned error: %v", err)
+	}
+	if got != "chris" {
+		t.Errorf("certCN default = %q, want %q", got, "chris")
+	}
+
+	p.config.CN.Template = "{user}@{domain}"
+	p.config.CN.Domain = "example.com"
+	got, err = p.certCN("Chris", "Chris@Example.com")
+	if err != nil {
+		t.Fatalf("certCN dotted template returned error: %v", err)
+	}
+	if got != "chris@example.com" {
+		t.Errorf("certCN dotted = %q, want %q", got, "chris@example.com")
+	}
+
+	p.config.CN.Pattern = `[a-z.]+`
+	if _, err := p.certCN("Chris", "Chris@Example.com"); err == nil {
+		t.Error("certCN should reject a CN that does not match the pattern")
+	}
+}
+
 func TestSameOrigin(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "https://portal.example.com/login", nil)
 	cases := map[string]bool{

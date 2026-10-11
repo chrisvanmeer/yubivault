@@ -23,7 +23,7 @@ var yubicoOriginOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 41482, 3, 3}
 
 var (
 	identityRe = regexp.MustCompile(`^[A-Za-z0-9._@+-]{1,254}$`)
-	cnRe       = regexp.MustCompile(`^[a-z0-9._+-]{1,64}$`)
+	cnRe       = regexp.MustCompile(`^[a-z0-9._+@-]{1,64}$`)
 	attestCNRe = regexp.MustCompile(`(?i)^YubiKey PIV Attestation (9a|9c)$`)
 )
 
@@ -93,20 +93,40 @@ func NormalizeCN(identity string) string {
 	return strings.ToLower(local)
 }
 
-// ValidateIdentity rejects identities that cannot produce a safe Common Name
-// or safe terminal command lines in the portal UI.
+// ValidateIdentity rejects identities that cannot produce safe terminal
+// command lines in the portal UI.
 func ValidateIdentity(identity string) error {
 	if !identityRe.MatchString(identity) {
 		return errors.New("identity contains unsupported characters")
 	}
-	return ValidateCN(NormalizeCN(identity))
+	return nil
+}
+
+// RenderCN builds the certificate Common Name from an OIDC identity using an
+// administrator supplied template. Placeholders: {user} (the local part of the
+// identity, lowercased), {email} (the email claim, falling back to the
+// identity) and {domain}. The result is lowercased and validated.
+func RenderCN(identity, email, template, domain string) (string, error) {
+	if email == "" {
+		email = identity
+	}
+	replacer := strings.NewReplacer(
+		"{user}", NormalizeCN(identity),
+		"{email}", email,
+		"{domain}", domain,
+	)
+	rendered := strings.ToLower(strings.TrimSpace(replacer.Replace(template)))
+	if err := ValidateCN(rendered); err != nil {
+		return "", err
+	}
+	return rendered, nil
 }
 
 // ValidateCN checks that a Common Name is safe to embed in terminal commands.
 func ValidateCN(cn string) error {
 	if !cnRe.MatchString(cn) {
 		return fmt.Errorf(
-			"common name '%s' must be 1-64 chars of a-z, 0-9, dot, underscore, plus or hyphen", cn)
+			"common name '%s' must be 1-64 chars of a-z, 0-9, dot, underscore, plus, at-sign or hyphen", cn)
 	}
 	return nil
 }
@@ -133,7 +153,7 @@ func (v *Verifier) Verify(csrPEM, attestPEM, intPEM []byte, expectedCN, selected
 	}
 	if csr.Subject.CommonName != expectedCN {
 		return nil, nil, fmt.Errorf(
-			"CSR Common Name '%s' must be '%s' (lowercase username, without domain)",
+			"CSR Common Name '%s' does not match the required Common Name '%s'",
 			csr.Subject.CommonName, expectedCN)
 	}
 

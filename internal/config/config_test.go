@@ -322,3 +322,63 @@ func TestManualPath(t *testing.T) {
 		t.Errorf("ManualFiles[default] = %q, want %q", got, want)
 	}
 }
+
+func TestCNDefaults(t *testing.T) {
+	c := validConfig(t)
+	if c.CN.Template != "{user}" {
+		t.Errorf("default cn.template = %q, want {user}", c.CN.Template)
+	}
+	if c.CN.Pattern != DefaultCNPattern {
+		t.Errorf("default cn.pattern = %q, want %q", c.CN.Pattern, DefaultCNPattern)
+	}
+	if c.AllowCNOverride() {
+		t.Error("cn.allow_user_override should default to false")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("default CN config rejected: %v", err)
+	}
+}
+
+func TestValidateCNTemplate(t *testing.T) {
+	c := validConfig(t)
+
+	c.CN.Template = "{user}@{domain}"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cn.domain") {
+		t.Errorf("expected cn.domain requirement error, got %v", err)
+	}
+
+	c.CN.Domain = "example.com"
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid dotted template rejected: %v", err)
+	}
+
+	c.CN.Template = "{user}@{bogus}"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cn.template") {
+		t.Errorf("expected cn.template placeholder error, got %v", err)
+	}
+
+	c.CN.Template = "bad space"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cn.template") {
+		t.Errorf("expected cn.template character error, got %v", err)
+	}
+
+	c.CN.Template = "{user}"
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid template rejected: %v", err)
+	}
+}
+
+func TestValidateCNPattern(t *testing.T) {
+	c := validConfig(t)
+	if err := c.ValidateCNPattern("chris@example.com"); err != nil {
+		t.Errorf("pattern should accept a valid CN: %v", err)
+	}
+	if err := c.ValidateCNPattern("Bad Name"); err == nil {
+		t.Error("pattern should reject a CN with a space")
+	}
+
+	c.CN.Pattern = "(["
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cn.pattern") {
+		t.Errorf("expected cn.pattern compile error, got %v", err)
+	}
+}

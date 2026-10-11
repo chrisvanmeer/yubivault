@@ -3,6 +3,7 @@ package pki
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // TestToInt64 guards the revoked/expired detection: the Vault API decodes JSON
@@ -29,4 +30,38 @@ func TestToInt64(t *testing.T) {
 			t.Errorf("%s: toInt64(%v) = %d, %v; want %d, %v", tc.name, tc.in, got, ok, tc.want, tc.ok)
 		}
 	}
+}
+
+func TestSortCertificates(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	certs := []ActiveCert{
+		{Serial: "oldest", NotAfter: base.AddDate(0, 0, 1)},
+		{Serial: "newest", NotAfter: base.AddDate(0, 0, 3)},
+		{Serial: "middle", NotAfter: base.AddDate(0, 0, 2)},
+	}
+	sortCertificates(certs)
+
+	want := []string{"newest", "middle", "oldest"}
+	for i, w := range want {
+		if certs[i].Serial != w {
+			t.Fatalf("position %d = %q, want %q (order: %v)", i, certs[i].Serial, w, serials(certs))
+		}
+	}
+
+	tie := []ActiveCert{
+		{Serial: "aaa", NotAfter: base},
+		{Serial: "bbb", NotAfter: base},
+	}
+	sortCertificates(tie)
+	if tie[0].Serial != "bbb" || tie[1].Serial != "aaa" {
+		t.Errorf("equal expiries should break on serial descending, got %v", serials(tie))
+	}
+}
+
+func serials(certs []ActiveCert) []string {
+	out := make([]string, len(certs))
+	for i, c := range certs {
+		out[i] = c.Serial
+	}
+	return out
 }

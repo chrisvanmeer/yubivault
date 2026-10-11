@@ -251,6 +251,30 @@ func (p *Portal) sessionIdentity(r *http.Request) (string, string) {
 	return identity, token
 }
 
+// sessionEmail returns the OIDC email claim stored at login, or "" when the
+// visitor is not authenticated.
+func (p *Portal) sessionEmail(r *http.Request) string {
+	session, err := p.cookieStore.Get(r, sessionName)
+	if err != nil {
+		return ""
+	}
+	email, _ := session.Values["user_email"].(string)
+	return email
+}
+
+// certCN renders the administrator-configured certificate Common Name for an
+// identity and checks it against the configured pattern.
+func (p *Portal) certCN(identity, email string) (string, error) {
+	cn, err := attestation.RenderCN(identity, email, p.config.CNTemplate(), p.config.CNDomain())
+	if err != nil {
+		return "", err
+	}
+	if err := p.config.ValidateCNPattern(cn); err != nil {
+		return "", err
+	}
+	return cn, nil
+}
+
 func (p *Portal) isAuthenticated(r *http.Request) bool {
 	identity, token := p.sessionIdentity(r)
 	return identity != "" && token != ""

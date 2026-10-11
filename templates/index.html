@@ -42,6 +42,8 @@
             {{- end -}}
         ];
         const CERT_CN = {{.CertCN}};
+        const CN_EDITABLE = {{if .CNEditable}}true{{else}}false{{end}};
+        const CN_PATTERN = {{if .CNPattern}}{{.CNPattern}}{{else}}""{{end}};
         let currentSlot = '9a';
         let currentKeyType = KEY_TYPES[0];
 
@@ -93,14 +95,36 @@
             refreshCommands();
         }
 
+        function currentCN() {
+            const el = document.getElementById('cn-input');
+            const v = el ? el.value.trim() : '';
+            return v || CERT_CN;
+        }
+
+        function cnIsValid(cn) {
+            if (!CN_PATTERN) return true;
+            try {
+                return new RegExp('^(?:' + CN_PATTERN + ')$').test(cn);
+            } catch (e) {
+                return true;
+            }
+        }
+
+        function syncCNField() {
+            const hidden = document.getElementById('cn-hidden-input');
+            if (hidden) hidden.value = currentCN();
+        }
+
         function refreshCommands() {
             const codeEl = document.getElementById('code-gen');
             if (!codeEl) return;
+            syncCNField();
+            const cn = currentCN();
             codeEl.textContent =
                 `# 1. Generate the ${currentKeyType.label} key pair in slot ${currentSlot}\n` +
                 `ykman piv keys generate ${currentSlot} public.pem -a ${currentKeyType.ykman}\n\n` +
-                `# 2. Create the Certificate Signing Request for CN=${CERT_CN}\n` +
-                `ykman piv certificates request ${currentSlot} public.pem user.csr -s "CN=${CERT_CN}"\n\n` +
+                `# 2. Create the Certificate Signing Request for CN=${cn}\n` +
+                `ykman piv certificates request ${currentSlot} public.pem user.csr -s "CN=${cn}"\n\n` +
                 `# 3. Create the hardware attestation certificate\n` +
                 `ykman piv keys attest ${currentSlot} attest.crt\n\n` +
                 `# 4. Export the Yubico intermediate certificate\n` +
@@ -199,9 +223,28 @@
         // The server decides whether a revocation warning is needed: it only
         // renders the confirmation when an active certificate actually exists.
         // ------------------------------------------------------------------
+        function cnEditChanged(el) {
+            const hint = document.getElementById('cn-hint');
+            const ok = el.value.trim() !== '' && cnIsValid(el.value.trim());
+            if (hint) {
+                hint.classList.toggle('text-red-600', !ok);
+                hint.classList.toggle('dark:text-red-400', !ok);
+            }
+            refreshCommands();
+        }
+
         function submitCSR() {
             const form = document.getElementById('csr-sign-form');
             if (!form.reportValidity()) return;
+            const cnInput = document.getElementById('cn-input');
+            const cnValue = cnInput ? cnInput.value.trim() : CERT_CN;
+            if (CN_EDITABLE && !cnIsValid(cnValue)) {
+                document.getElementById('response-area').innerHTML =
+                    '<div class="p-4 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">' +
+                    'The Common Name does not match the required format.</div>';
+                return;
+            }
+            syncCNField();
             document.getElementById('confirm-revoke-input').value = 'false';
             htmx.trigger(form, 'submit');
         }
@@ -268,16 +311,7 @@
                         Certificates
                     </a>
                     {{end}}
-                    {{if .ManualAvailable}}
-                    <button type="button" onclick="document.getElementById('manual-modal').classList.remove('hidden')"
-                        class="hidden sm:inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 px-2.5 py-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700/60 transition cursor-pointer">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
-                        </svg>
-                        Manual
-                    </button>
-                    {{end}}
+                    {{template "manual_nav" .}}
                     <div class="flex items-center bg-slate-100/80 dark:bg-slate-700/80 rounded-full py-1 px-3 border border-slate-200 dark:border-slate-600">
                         <div
                             class="h-6 w-6 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex items-center justify-center text-xs font-bold uppercase mr-2 shadow-sm">
@@ -435,7 +469,19 @@ sudo pacman -S yubikey-manager</pre>
                         </div>
                         {{end}}
 
-                        <div class="relative group code-wrap">
+                        {{if .CNEditable}}
+                        <!-- Editable Common Name -->
+                        <p class="label-sm mt-4">Certificate CN</p>
+                        <input id="cn-input" type="text" value="{{.CertCN}}" required autocomplete="off"
+                            spellcheck="false" oninput="cnEditChanged(this)"
+                            class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500" />
+                        <p id="cn-hint" class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                            Adjust the Common Name if needed. It must match
+                            <code class="code-inline">{{.CNPattern}}</code>
+                        </p>
+                        {{end}}
+
+                        <div class="relative group code-wrap mt-4">
                             <button onclick="copyToClipboard(this, 'code-gen')" class="copy-btn copy-btn-lg" title="Copy code">
                                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -476,6 +522,7 @@ ykman piv certificates export f9 intermediate.crt</pre>
                             <input type="hidden" name="slot" id="selected-slot-input" value="9a" />
                             <input type="hidden" name="key_type" id="selected-keytype-input" value="{{with .KeyTypes}}{{(index . 0).Name}}{{end}}" />
                             <input type="hidden" name="confirm_revoke" id="confirm-revoke-input" value="false" />
+                            <input type="hidden" name="cn" id="cn-hidden-input" value="{{.CertCN}}" />
 
                             <div class="space-y-4 flex-1">
                                 <!-- CSR -->

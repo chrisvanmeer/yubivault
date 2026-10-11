@@ -52,6 +52,24 @@ vault:
   # approle_role_id: "YOUR_ROLE_ID_HERE"
   # approle_secret_id: "YOUR_SECRET_ID_HERE"
 
+cn:
+  # Template for the certificate Common Name. Placeholders:
+  #   {user}    local part of the OIDC identity, lowercased (before '@')
+  #   {email}   the OIDC email claim (falls back to the identity)
+  #   {domain}  the domain configured below
+  # Examples:
+  #   template: "{user}"           -> chris
+  #   template: "{user}@{domain}"  -> chris@example.com
+  #   template: "{user}.{domain}"  -> chris.example.com
+  #   template: "{email}"          -> chris@example.com
+  template: "{user}"
+  # domain: "example.com"   # required when the template uses {domain}
+  # Optional RE2 pattern the final CN must match in full. Defaults to a
+  # shell-safe set of characters, 1-64 long:
+  # pattern: "[a-z0-9._+@-]{1,64}"
+  # allow_user_override: true -> defaults to false. When true the visitor may
+  #   edit the CN in the portal; it is still validated against the pattern.
+
 oidc:
   issuer: "https://idp.example.com/realms/master"
   client_id: "yubivault"

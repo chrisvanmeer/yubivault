@@ -33,6 +33,8 @@ func indexData(loggedIn bool) map[string]any {
 		"IsLoggedIn":          loggedIn,
 		"UserIdentity":        "Chris@Example.com",
 		"CertCN":              "chris",
+		"CNEditable":          false,
+		"CNPattern":           "[a-z0-9._+@-]{1,64}",
 		"KeyTypes":            []keyTypeChoice{{Name: "eccp256", Ykman: "ECCP256", Label: "ECC P-256", Detail: "Fast"}, {Name: "rsa3072", Ykman: "RSA3072", Label: "RSA 3072", Detail: "Compatible"}},
 		"UITitle":             "YubiVault Portal",
 		"UIShortTitle":        "YBV",
@@ -45,7 +47,7 @@ func indexData(loggedIn bool) map[string]any {
 
 func TestTemplatesParse(t *testing.T) {
 	tmpl := parseTemplates(t)
-	for _, name := range []string{"index.html", "cert_modal.html", "confirm_revoke.html", "inventory.html", "manual_modal"} {
+	for _, name := range []string{"index.html", "cert_modal.html", "confirm_revoke.html", "inventory.html", "manual_modal", "manual_nav"} {
 		if tmpl.Lookup(name) == nil {
 			t.Errorf("template %s is not registered", name)
 		}
@@ -86,6 +88,40 @@ func TestRenderManualModal(t *testing.T) {
 	}
 }
 
+func TestRenderManualNav(t *testing.T) {
+	tmpl := parseTemplates(t)
+
+	hidden := render(t, tmpl, "manual_nav", map[string]any{"ManualAvailable": false})
+	if bytes.Contains([]byte(hidden), []byte("Manual")) {
+		t.Error("manual nav should not render when unavailable")
+	}
+
+	multi := render(t, tmpl, "manual_nav", map[string]any{
+		"ManualAvailable": true,
+		"ManualDocs": []manualDoc{
+			{Key: "macos", Label: "macOS"},
+			{Key: "windows", Label: "Windows"},
+			{Key: "linux", Label: "Linux"},
+		},
+	})
+	for _, want := range []string{"manual-menu", "toggleManualMenu", "openManual('macos')", "openManual('windows')", "openManual('linux')", ">macOS<", ">Windows<", ">Linux<"} {
+		if !bytes.Contains([]byte(multi), []byte(want)) {
+			t.Errorf("manual nav dropdown missing %q", want)
+		}
+	}
+
+	single := render(t, tmpl, "manual_nav", map[string]any{
+		"ManualAvailable": true,
+		"ManualDocs":      []manualDoc{{Key: "default", Label: "Manual"}},
+	})
+	if !bytes.Contains([]byte(single), []byte("openManual('default')")) {
+		t.Error("single-manual nav should open the document directly")
+	}
+	if bytes.Contains([]byte(single), []byte("manual-menu")) {
+		t.Error("single-manual nav should not render a dropdown menu")
+	}
+}
+
 func TestRenderIndex(t *testing.T) {
 	tmpl := parseTemplates(t)
 
@@ -116,6 +152,52 @@ func TestRenderIndex(t *testing.T) {
 	noCerts["CertificatesEnabled"] = false
 	if out := render(t, tmpl, "index.html", noCerts); bytes.Contains([]byte(out), []byte(`href="/certs"`)) {
 		t.Error("disabled certificate page link leaked into index.html output")
+	}
+}
+
+func TestRenderIndexCNOverride(t *testing.T) {
+	tmpl := parseTemplates(t)
+
+	locked := render(t, tmpl, "index.html", indexData(true))
+	if bytes.Contains([]byte(locked), []byte(`id="cn-input"`)) {
+		t.Error("CN input should not render when overriding is disabled")
+	}
+
+	data := indexData(true)
+	data["CNEditable"] = true
+	editable := render(t, tmpl, "index.html", data)
+	for _, want := range []string{
+		`id="cn-input"`,
+		`id="cn-hidden-input"`,
+		`const CN_EDITABLE = true;`,
+		`const CN_PATTERN = "[a-z0-9._+@-]{1,64}";`,
+	} {
+		if !bytes.Contains([]byte(editable), []byte(want)) {
+			t.Errorf("editable index missing %q", want)
+		}
+	}
+	if bytes.Contains([]byte(editable), []byte("{{")) {
+		t.Error("unrendered template action leaked into editable index output")
+	}
+}
+
+func TestRenderIndexManualNav(t *testing.T) {
+	tmpl := parseTemplates(t)
+
+	plain := render(t, tmpl, "index.html", indexData(true))
+	if bytes.Contains([]byte(plain), []byte("data-manual-dropdown")) {
+		t.Error("index without manuals should not render the manual nav")
+	}
+
+	data := indexData(true)
+	data["ManualAvailable"] = true
+	data["ManualDocs"] = []manualDoc{{Key: "macos", Label: "macOS"}, {Key: "windows", Label: "Windows"}}
+	out := render(t, tmpl, "index.html", data)
+	if !bytes.Contains([]byte(out), []byte("data-manual-dropdown")) {
+		t.Error("index with manuals should render the manual nav dropdown")
+	}
+	if bytes.Contains([]byte(out), []byte("{{")) {
+		t.Error("unrendered template action leaked into index.html output")
 	}
 }
 

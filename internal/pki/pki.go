@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"time"
 
@@ -211,7 +212,21 @@ func (s *Service) listCertificates(client *vault.Client, filterCN string) ([]Act
 		}
 		certs = append(certs, entry)
 	}
+
+	sortCertificates(certs)
 	return certs, nil
+}
+
+// sortCertificates orders certificates from most to least recent. NotAfter is
+// the best available proxy for issuance time: with a fixed TTL, a later
+// issuance expires later. Ties break on serial, descending.
+func sortCertificates(certs []ActiveCert) {
+	sort.SliceStable(certs, func(i, j int) bool {
+		if certs[i].NotAfter.Equal(certs[j].NotAfter) {
+			return certs[i].Serial > certs[j].Serial
+		}
+		return certs[i].NotAfter.After(certs[j].NotAfter)
+	})
 }
 
 // RevokeCertificates revokes the given serials and reports how many failed.

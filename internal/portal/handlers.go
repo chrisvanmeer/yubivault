@@ -56,10 +56,14 @@ func (p *Portal) handleIndex(w http.ResponseWriter, r *http.Request) {
 	identity, token := p.sessionIdentity(r)
 	isLoggedIn := identity != "" && token != ""
 
+	cn, _ := p.certCN(identity, p.sessionEmail(r))
+
 	data := map[string]any{
 		"IsLoggedIn":          isLoggedIn,
 		"UserIdentity":        identity,
-		"CertCN":              attestation.NormalizeCN(identity),
+		"CertCN":              cn,
+		"CNEditable":          p.config.AllowCNOverride(),
+		"CNPattern":           p.config.CNPattern(),
 		"KeyTypes":            keyTypeChoices(p.config),
 		"UITitle":             p.config.UI.Title,
 		"UIShortTitle":        p.config.UI.ShortTitle,
@@ -177,8 +181,15 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 			"Your account name cannot be used as a certificate Common Name. Contact your administrator.")
 		return
 	}
+	if _, err := p.certCN(identity, claims.Email); err != nil {
+		p.logger.Warn("rejected login due to unusable Common Name", "identity", identity, "error", err)
+		renderError(w, http.StatusForbidden,
+			"Your account name cannot be used as a certificate Common Name. Contact your administrator.")
+		return
+	}
 
 	session.Values["user_identity"] = identity
+	session.Values["user_email"] = claims.Email
 	session.Values["raw_id_token"] = rawIDToken
 	delete(session.Values, "oauth_state")
 	delete(session.Values, "oauth_nonce")
@@ -236,11 +247,26 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusUnauthorized, "Your session has expired. Please log in again.")
 		return
 	}
-	cn := attestation.NormalizeCN(identity)
-	if err := attestation.ValidateCN(cn); err != nil {
+	cn, err := p.certCN(identity, p.sessionEmail(r))
+	if err != nil {
 		renderError(w, http.StatusForbidden,
 			"Your account name cannot be used as a certificate Common Name.")
 		return
+	}
+	if p.config.AllowCNOverride() {
+		if override := strings.ToLower(strings.TrimSpace(r.FormValue("cn"))); override != "" && override != cn {
+			if err := attestation.ValidateCN(override); err != nil {
+				renderError(w, http.StatusBadRequest,
+					"The Common Name you entered contains unsupported characters.")
+				return
+			}
+			if err := p.config.ValidateCNPattern(override); err != nil {
+				renderError(w, http.StatusBadRequest,
+					"The Common Name you entered does not match the required format.")
+				return
+			}
+			cn = override
+		}
 	}
 
 	selectedSlot := r.FormValue("slot")
@@ -365,7 +391,13 @@ func (p *Portal) handleActiveCert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	identity, _ := p.sessionIdentity(r)
-	active, err := p.pki.FindActiveCertificates(attestation.NormalizeCN(identity))
+	cn, err := p.certCN(identity, p.sessionEmail(r))
+	if err != nil {
+		renderError(w, http.StatusForbidden,
+			"Your account name cannot be used as a certificate Common Name.")
+		return
+	}
+	active, err := p.pki.FindActiveCertificates(cn)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err != nil {
 		p.logger.Warn("active certificate lookup failed", "identity", identity, "error", err)
@@ -395,10 +427,12 @@ func (p *Portal) handleInventory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cn, _ := p.certCN(identity, p.sessionEmail(r))
+
 	data := map[string]any{
 		"IsLoggedIn":          true,
 		"UserIdentity":        identity,
-		"CertCN":              attestation.NormalizeCN(identity),
+		"CertCN":              cn,
 		"UITitle":             p.config.UI.Title,
 		"UIShortTitle":        p.config.UI.ShortTitle,
 		"HasAppRole":          p.config.Vault.AppRoleRoleID != "" && p.config.Vault.AppRoleSecretID != "",

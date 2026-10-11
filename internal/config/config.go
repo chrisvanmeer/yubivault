@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,7 +24,21 @@ const (
 	defaultLogGroup = "yubivault"
 
 	exampleSessionSecret = "super-secret-32-byte-key-here!!"
+
+	// DefaultCNPattern is the default cn.pattern: a shell-safe set of
+	// characters, at most 64 long. It is matched against the whole CN.
+	DefaultCNPattern = "[a-z0-9._+@-]{1,64}"
 )
+
+// cnPlaceholders are the placeholders understood in cn.template.
+var cnPlaceholders = []string{"{user}", "{email}", "{domain}"}
+
+// cnPlaceholderRe matches any {..} token so unknown placeholders are reported.
+var cnPlaceholderRe = regexp.MustCompile(`\{[^}]*\}`)
+
+// cnLiteralRe matches the characters a template may contain outside its
+// placeholders. The rendered CN is lowercased before validation.
+var cnLiteralRe = regexp.MustCompile(`^[A-Za-z0-9._@+-]*$`)
 
 // supportedKeyTypes maps the configured key type to the canonical ykman
 // algorithm name.
@@ -72,6 +88,23 @@ type Config struct {
 		// visitor's OS.
 		Manuals map[string]string `yaml:"manuals"`
 	} `yaml:"ui"`
+	CN struct {
+		// Template renders the certificate Common Name. Supported
+		// placeholders: {user} (the local part of the OIDC identity,
+		// lowercased), {email} (the OIDC email claim, falling back to the
+		// identity) and {domain}. Literal text (prefixes/suffixes) is
+		// allowed, e.g. "{user}@{domain}".
+		Template string `yaml:"template"`
+		// Domain substitutes the {domain} placeholder in Template.
+		Domain string `yaml:"domain"`
+		// Pattern is a RE2 regular expression the final Common Name must
+		// match in full. It complements the built-in shell-safe check.
+		Pattern string `yaml:"pattern"`
+		// AllowUserOverride lets the visitor edit the Common Name in the UI.
+		// The value is still validated against Template's placeholders and
+		// Pattern by the server.
+		AllowUserOverride bool `yaml:"allow_user_override"`
+	} `yaml:"cn"`
 	Vault struct {
 		Address         string `yaml:"address"`
 		PKIMount        string `yaml:"pki_mount"`
@@ -176,6 +209,37 @@ func (c *Config) ManualPath(osKey string) string {
 	return c.resolveManual(c.UI.ManualFile)
 }
 
+// CNTemplate returns the configured Common Name template.
+func (c *Config) CNTemplate() string { return c.CN.Template }
+
+// CNDomain returns the domain substituted for the {domain} placeholder.
+func (c *Config) CNDomain() string { return c.CN.Domain }
+
+// CNPattern returns the RE2 pattern the final Common Name must match in full.
+func (c *Config) CNPattern() string { return c.CN.Pattern }
+
+// AllowCNOverride reports whether the visitor may edit the Common Name in the
+// UI. It defaults to false.
+func (c *Config) AllowCNOverride() bool { return c.CN.AllowUserOverride }
+
+// compileCNPattern anchors the configured pattern so it must match the whole
+// Common Name, not just a substring.
+func compileCNPattern(pattern string) (*regexp.Regexp, error) {
+	return regexp.Compile("^(?:" + pattern + ")$")
+}
+
+// ValidateCNPattern reports whether cn satisfies the configured cn.pattern.
+func (c *Config) ValidateCNPattern(cn string) error {
+	re, err := compileCNPattern(c.CN.Pattern)
+	if err != nil {
+		return fmt.Errorf("cn.pattern is not a valid regular expression: %w", err)
+	}
+	if !re.MatchString(cn) {
+		return fmt.Errorf("common name '%s' does not match the required format", cn)
+	}
+	return nil
+}
+
 // RateLimitLogin is the allowed number of login attempts per minute per IP.
 func (c *Config) RateLimitLogin() int {
 	if c.Server.RateLimitLogin <= 0 {
@@ -261,6 +325,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Vault.RevokeMode == "" {
 		c.Vault.RevokeMode = RevokeModeStrict
+	}
+	if c.CN.Template == "" {
+		c.CN.Template = "{user}"
+	}
+	if c.CN.Pattern == "" {
+		c.CN.Pattern = DefaultCNPattern
 	}
 	if c.Yubico.RootCAFile == "" {
 		c.Yubico.RootCAFile = "yubico-roots.pem"
@@ -373,6 +443,15 @@ func (c *Config) Validate() error {
 		errs = append(errs, "oidc.redirect_url is required (e.g. https://yubivault.example.com/callback)")
 	}
 
+	if err := validateCNTemplate(c.CN.Template, c.CN.Domain); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if c.CN.Pattern == "" {
+		errs = append(errs, "cn.pattern must not be empty")
+	} else if _, err := compileCNPattern(c.CN.Pattern); err != nil {
+		errs = append(errs, fmt.Sprintf("cn.pattern is not a valid regular expression: %v", err))
+	}
+
 	if c.Yubico.RootCAFile == "" {
 		errs = append(errs, "yubico.root_ca_file is required")
 	} else if _, err := os.Stat(c.Yubico.RootCAFile); err != nil {
@@ -437,6 +516,34 @@ func manualNeedsDir(file string, manuals map[string]string) bool {
 		}
 	}
 	return false
+}
+
+// validateCNTemplate checks that a Common Name template only uses known
+// placeholders and safe literal characters, and that {domain} has a value.
+func validateCNTemplate(tmpl, domain string) error {
+	if tmpl == "" {
+		return errors.New("cn.template must not be empty")
+	}
+	for _, ph := range cnPlaceholderRe.FindAllString(tmpl, -1) {
+		switch ph {
+		case "{user}", "{email}", "{domain}":
+		default:
+			return fmt.Errorf(
+				"cn.template contains unknown placeholder %s (allowed: {user}, {email}, {domain})", ph)
+		}
+	}
+	if strings.Contains(tmpl, "{domain}") && domain == "" {
+		return errors.New("cn.domain is required when cn.template uses {domain}")
+	}
+	literal := tmpl
+	for _, ph := range cnPlaceholders {
+		literal = strings.ReplaceAll(literal, ph, "")
+	}
+	if !cnLiteralRe.MatchString(literal) {
+		return fmt.Errorf(
+			"cn.template '%s' may only contain the placeholders {user}, {email}, {domain} and the characters a-z A-Z 0-9 . _ + @ -", tmpl)
+	}
+	return nil
 }
 
 // validateManual appends validation errors for a single manual document. A

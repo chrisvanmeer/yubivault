@@ -26,16 +26,53 @@ func TestNormalizeCN(t *testing.T) {
 }
 
 func TestValidateCN(t *testing.T) {
-	valid := []string{"chris", "alice.smith", "a+b", "a_b", "a-b", strings.Repeat("a", 64)}
+	valid := []string{"chris", "alice.smith", "a+b", "a_b", "a-b", "a@b", "chris@example.com", strings.Repeat("a", 64)}
 	for _, cn := range valid {
 		if err := ValidateCN(cn); err != nil {
 			t.Errorf("ValidateCN(%q) unexpected error: %v", cn, err)
 		}
 	}
-	invalid := []string{"", "UPPER", "with space", "a@b", "semi;colon", strings.Repeat("a", 65)}
+	invalid := []string{"", "UPPER", "with space", "semi;colon", "a/b", "a\\b", `quote"x`, strings.Repeat("a", 65)}
 	for _, cn := range invalid {
 		if err := ValidateCN(cn); err == nil {
 			t.Errorf("ValidateCN(%q) expected error, got nil", cn)
+		}
+	}
+}
+
+func TestRenderCN(t *testing.T) {
+	cases := []struct {
+		identity string
+		email    string
+		template string
+		domain   string
+		want     string
+	}{
+		{"chris", "chris@example.com", "{user}", "", "chris"},
+		{"Chris", "Chris@Example.com", "{user}@{domain}", "example.com", "chris@example.com"},
+		{"chris", "chris@example.com", "{user}.{domain}", "example.com", "chris.example.com"},
+		{"chris", "Chris@Example.com", "{email}", "", "chris@example.com"},
+		{"chris", "", "{email}", "", "chris"},
+		{"chris", "chris@example.com", "vpn-{user}", "example.com", "vpn-chris"},
+	}
+	for _, c := range cases {
+		got, err := RenderCN(c.identity, c.email, c.template, c.domain)
+		if err != nil {
+			t.Errorf("RenderCN(%q, %q, %q, %q) unexpected error: %v",
+				c.identity, c.email, c.template, c.domain, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("RenderCN(%q, %q, %q, %q) = %q, want %q",
+				c.identity, c.email, c.template, c.domain, got, c.want)
+		}
+	}
+}
+
+func TestRenderCNRejectsBadTemplates(t *testing.T) {
+	for _, tmpl := range []string{"", "{user}-{unknown}", "has space", "bad/slash"} {
+		if _, err := RenderCN("chris", "chris@example.com", tmpl, "example.com"); err == nil {
+			t.Errorf("RenderCN with template %q expected error, got nil", tmpl)
 		}
 	}
 }
