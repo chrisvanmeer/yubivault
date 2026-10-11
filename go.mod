@@ -6,7 +6,9 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/gorilla/sessions v1.4.0
 	github.com/hashicorp/vault/api v1.23.0
+	github.com/yuin/goldmark v1.8.2
 	golang.org/x/oauth2 v0.37.0
+	golang.org/x/time v0.12.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -28,5 +30,4 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/time v0.12.0 // indirect
 )

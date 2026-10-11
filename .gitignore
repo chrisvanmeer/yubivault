@@ -9,6 +9,9 @@
 # Standalone CLI Binaries
 tailwindcss-*
 
+# Node tooling (used only to rebuild static/tailwind.css)
+node_modules/
+
 # Local Configuration & Secrets
 config.yaml
 *.key

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Example OpenVPN Connect screenshot">
+  <rect width="640" height="360" fill="#f1f5f9"/>
+  <rect x="1" y="1" width="638" height="358" fill="none" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="320" y="150" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="600" fill="#334155" text-anchor="middle">Example screenshot</text>
+  <text x="320" y="190" font-family="system-ui, -apple-system, sans-serif" font-size="15" fill="#64748b" text-anchor="middle">OpenVPN Connect &#8594; Certificate and Key &#8594; Hardware Tokens</text>
+  <text x="320" y="220" font-family="system-ui, -apple-system, sans-serif" font-size="13" fill="#94a3b8" text-anchor="middle">Replace this placeholder with a real screenshot</text>
+</svg>

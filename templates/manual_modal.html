@@ -1,0 +1,88 @@
+{{define "manual_modal"}}
+{{if .ManualAvailable}}
+<div id="manual-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm animate-fade-in"
+    onclick="if (event.target === this) this.classList.add('hidden')">
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl w-full max-w-4xl h-[85vh] flex flex-col overflow-hidden">
+        <!-- Header -->
+        <div class="flex items-center justify-between px-5 py-3 border-b border-slate-200 dark:border-slate-700 flex-shrink-0 gap-3">
+            <div class="flex items-center gap-2.5 min-w-0">
+                <span class="logo-chip">
+                    <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                    </svg>
+                </span>
+                <h3 class="text-base font-bold text-slate-900 dark:text-white">Manual</h3>
+            </div>
+            <div class="flex items-center gap-2">
+                {{range .ManualDocs}}{{if eq .Key $.ManualSelected}}
+                <a id="manual-download" href="{{.URL}}&download=1"
+                    class="inline-flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700/60 transition">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-5l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                    Download
+                </a>
+                {{end}}{{end}}
+                <button type="button" onclick="document.getElementById('manual-modal').classList.add('hidden')"
+                    aria-label="Close manual"
+                    class="p-1.5 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700/60 transition cursor-pointer">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- OS tabs -->
+        {{if gt (len .ManualDocs) 1}}
+        <div class="flex items-center gap-1 px-5 py-2 border-b border-slate-200 dark:border-slate-700 flex-shrink-0 flex-wrap">
+            {{range .ManualDocs}}
+            <button type="button" data-manual-tab="{{.Key}}" onclick="selectManual('{{.Key}}')"
+                class="manual-tab px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer{{if eq .Key $.ManualSelected}} border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30{{else}} border-transparent text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700/60{{end}}">{{.Label}}</button>
+            {{end}}
+        </div>
+        {{end}}
+
+        <!-- Body -->
+        <div class="flex-1 min-h-0 bg-slate-100 dark:bg-slate-900">
+            {{range .ManualDocs}}
+            <div data-manual-panel="{{.Key}}" class="w-full h-full{{if ne .Key $.ManualSelected}} hidden{{end}}">
+                {{if .IsPDF}}
+                <iframe {{if eq .Key $.ManualSelected}}src="{{.URL}}"{{else}}data-src="{{.URL}}"{{end}} title="{{.Label}} manual"
+                    class="w-full h-full border-0"></iframe>
+                {{else}}
+                <div class="h-full overflow-y-auto p-6 sm:p-8 markdown-body">{{.HTML}}</div>
+                {{end}}
+            </div>
+            {{end}}
+        </div>
+    </div>
+</div>
+<script>
+    const MANUAL_TAB_BASE = "manual-tab px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer";
+    const MANUAL_TAB_ON = " border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30";
+    const MANUAL_TAB_OFF = " border-transparent text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700/60";
+    function selectManual(key) {
+        document.querySelectorAll('[data-manual-tab]').forEach(function (btn) {
+            btn.className = MANUAL_TAB_BASE + (btn.dataset.manualTab === key ? MANUAL_TAB_ON : MANUAL_TAB_OFF);
+        });
+        document.querySelectorAll('[data-manual-panel]').forEach(function (panel) {
+            const on = panel.dataset.manualPanel === key;
+            panel.classList.toggle('hidden', !on);
+            if (on) {
+                const frame = panel.querySelector('iframe[data-src]');
+                if (frame && !frame.src) {
+                    frame.src = frame.dataset.src;
+                }
+            }
+        });
+        const dl = document.getElementById('manual-download');
+        if (dl) {
+            dl.href = '/manual/raw?os=' + encodeURIComponent(key) + '&download=1';
+        }
+    }
+</script>
+{{end}}
+{{end}}

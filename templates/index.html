@@ -11,10 +11,9 @@
     <link href="/static/tailwind.css" rel="stylesheet">
 
     <script>
-        // Global state
-        window.isRevokeConfirmed = false;
-
-        // 1. Theme detection and toggle logic
+        // ------------------------------------------------------------------
+        // 1. Theme detection and toggle
+        // ------------------------------------------------------------------
         function applyTheme() {
             const savedTheme = localStorage.getItem('theme');
             if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
@@ -25,13 +24,8 @@
         }
 
         function toggleTheme() {
-            if (document.documentElement.classList.contains('dark')) {
-                document.documentElement.classList.remove('dark');
-                localStorage.setItem('theme', 'light');
-            } else {
-                document.documentElement.classList.add('dark');
-                localStorage.setItem('theme', 'dark');
-            }
+            const isDark = document.documentElement.classList.toggle('dark');
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
         }
 
         applyTheme();
@@ -39,7 +33,21 @@
             if (!localStorage.getItem('theme')) applyTheme();
         });
 
-        // 2. Tab switching logic for OS
+        // ------------------------------------------------------------------
+        // 2. Portal configuration injected by the server
+        // ------------------------------------------------------------------
+        const KEY_TYPES = [
+            {{- range $i, $kt := .KeyTypes -}}
+            {{if $i}},{{end}}{name: "{{$kt.Name}}", ykman: "{{$kt.Ykman}}", label: "{{$kt.Label}}", detail: "{{$kt.Detail}}"}
+            {{- end -}}
+        ];
+        const CERT_CN = {{.CertCN}};
+        let currentSlot = '9a';
+        let currentKeyType = KEY_TYPES[0];
+
+        // ------------------------------------------------------------------
+        // 3. OS tab switching (Step 1)
+        // ------------------------------------------------------------------
         function switchTab(os) {
             document.querySelectorAll('.os-tab-content').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.os-tab-btn').forEach(el => {
@@ -52,39 +60,56 @@
             activeBtn.classList.add('border-blue-600', 'text-blue-600', 'dark:border-blue-400', 'dark:text-blue-400');
         }
 
-        // 3. Slot switching logic for Step 2 and Form
-        function switchSlot(slot) {
-            // Send selected slot to hidden input in the form
-            const slotInput = document.getElementById('selected-slot-input');
-            if (slotInput) slotInput.value = slot;
-
-            document.querySelectorAll('.slot-tab-btn').forEach(el => {
-                el.classList.remove('border-blue-600', 'text-blue-600', 'dark:border-blue-400', 'dark:text-blue-400');
+        // ------------------------------------------------------------------
+        // 4. Slot & key type selection (Step 2)
+        // ------------------------------------------------------------------
+        function markActive(selector, activeEl) {
+            document.querySelectorAll(selector).forEach(el => {
+                el.classList.remove('border-blue-600', 'text-blue-600', 'dark:border-blue-400', 'dark:text-blue-400', 'bg-blue-50', 'dark:bg-blue-900/30');
                 el.classList.add('border-transparent', 'text-slate-500', 'dark:text-slate-400');
             });
-            const activeBtn = document.getElementById('btn-slot-' + slot);
-            if (activeBtn) {
-                activeBtn.classList.remove('border-transparent', 'text-slate-500', 'dark:text-slate-400');
-                activeBtn.classList.add('border-blue-600', 'text-blue-600', 'dark:border-blue-400', 'dark:text-blue-400');
-            }
+            activeEl.classList.remove('border-transparent', 'text-slate-500', 'dark:text-slate-400');
+            activeEl.classList.add('border-blue-600', 'text-blue-600', 'dark:border-blue-400', 'dark:text-blue-400', 'bg-blue-50', 'dark:bg-blue-900/30');
+        }
 
+        function switchSlot(slot) {
+            currentSlot = slot;
+            const slotInput = document.getElementById('selected-slot-input');
+            if (slotInput) slotInput.value = currentSlot;
+            const activeBtn = document.getElementById('btn-slot-' + slot);
+            if (activeBtn) markActive('.slot-tab-btn', activeBtn);
+            refreshCommands();
+        }
+
+        function switchKeyType(name) {
+            const kt = KEY_TYPES.find(k => k.name === name);
+            if (!kt) return;
+            currentKeyType = kt;
+            const typeInput = document.getElementById('selected-keytype-input');
+            if (typeInput) typeInput.value = kt.name;
+            const activeBtn = document.getElementById('btn-keytype-' + name);
+            if (activeBtn) markActive('.keytype-tab-btn', activeBtn);
+            document.querySelectorAll('[data-keytype-label]').forEach(el => el.textContent = kt.label);
+            refreshCommands();
+        }
+
+        function refreshCommands() {
             const codeEl = document.getElementById('code-gen');
             if (!codeEl) return;
-
-            const rsaBits = codeEl.getAttribute('data-rsa-bits') || '2048';
-            const userIdentity = codeEl.getAttribute('data-user-identity') || '';
-
-            codeEl.textContent = `# 1. Generate RSA ${rsaBits} key pair in slot ${slot}\n` +
-                `ykman piv keys generate ${slot} public.pem -a RSA${rsaBits}\n\n` +
-                `# 2. Create the Certificate Signing Request (CSR)\n` +
-                `ykman piv certificates request ${slot} public.pem user.csr -s "CN=${userIdentity}"\n\n` +
+            codeEl.textContent =
+                `# 1. Generate the ${currentKeyType.label} key pair in slot ${currentSlot}\n` +
+                `ykman piv keys generate ${currentSlot} public.pem -a ${currentKeyType.ykman}\n\n` +
+                `# 2. Create the Certificate Signing Request for CN=${CERT_CN}\n` +
+                `ykman piv certificates request ${currentSlot} public.pem user.csr -s "CN=${CERT_CN}"\n\n` +
                 `# 3. Create the hardware attestation certificate\n` +
-                `ykman piv keys attest ${slot} attest.crt\n\n` +
-                `# 4. Export the Yubico Intermediate certificate\n` +
+                `ykman piv keys attest ${currentSlot} attest.crt\n\n` +
+                `# 4. Export the Yubico intermediate certificate\n` +
                 `ykman piv certificates export f9 intermediate.crt`;
         }
 
-        // 4. Compact Drag & Drop Logic
+        // ------------------------------------------------------------------
+        // 5. Compact drag & drop logic
+        // ------------------------------------------------------------------
         function setupFileZone(inputId, zoneId, textId, iconId, defaultExt) {
             const input = document.getElementById(inputId);
             const zone = document.getElementById(zoneId);
@@ -132,7 +157,9 @@
             });
         }
 
-        // 5. Copy to Clipboard logic
+        // ------------------------------------------------------------------
+        // 6. Clipboard helpers
+        // ------------------------------------------------------------------
         function copyToClipboard(button, targetId) {
             const targetEl = document.getElementById(targetId);
             const textToCopy = targetEl.innerText || targetEl.textContent;
@@ -140,63 +167,19 @@
             navigator.clipboard.writeText(textToCopy.trim()).then(() => {
                 const originalHTML = button.innerHTML;
                 button.innerHTML = `<svg class="w-4 h-4 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>`;
-
-                setTimeout(() => {
-                    button.innerHTML = originalHTML;
-                }, 2000);
-            }).catch(err => {
-                console.error('Failed to copy: ', err);
-            });
+                setTimeout(() => { button.innerHTML = originalHTML; }, 2000);
+            }).catch(err => console.error('Failed to copy: ', err));
         }
 
-        // 6. Explicit Modal & Form Submit Logic (Bypassing HTMX weirdness)
-        function checkRevoke() {
-            const form = document.getElementById('csr-sign-form');
-            const isRevokeEnabled = form.getAttribute('data-revoke-existing') === 'true';
-
-            // Ensure the user actually selected all required files before doing anything
-            if (!form.reportValidity()) {
-                return;
-            }
-
-            if (isRevokeEnabled) {
-                // Show modal, pause execution
-                document.getElementById('revoke-warning-modal').classList.remove('hidden');
-            } else {
-                // Submit safely to HTMX if revocation is turned off
-                htmx.trigger(form, 'submit');
-            }
-        }
-
-        function confirmRevocationAndSubmit() {
-            // Hide modal
-            document.getElementById('revoke-warning-modal').classList.add('hidden');
-
-            // Programmatically trigger HTMX submit event
-            const form = document.getElementById('csr-sign-form');
-            htmx.trigger(form, 'submit');
-        }
-
-        function cancelRevocation() {
-            // Hide modal and do nothing
-            document.getElementById('revoke-warning-modal').classList.add('hidden');
-        }
-
-        // 7. Copy Modal Certificate Logic
         function copyCertToClipboard(button) {
             const certText = document.getElementById('issued-cert-text').value;
             navigator.clipboard.writeText(certText.trim()).then(() => {
                 const originalHTML = button.innerHTML;
                 button.innerHTML = `<svg class="w-4 h-4 mr-2 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>Copied!`;
-                setTimeout(() => {
-                    button.innerHTML = originalHTML;
-                }, 2000);
-            }).catch(err => {
-                console.error('Failed to copy cert: ', err);
-            });
+                setTimeout(() => { button.innerHTML = originalHTML; }, 2000);
+            }).catch(err => console.error('Failed to copy cert: ', err));
         }
 
-        // 8. Download Modal Certificate Logic
         function downloadCert() {
             const certText = document.getElementById('issued-cert-text').value;
             const blob = new Blob([certText], { type: 'application/x-x509-ca-cert' });
@@ -210,6 +193,41 @@
             URL.revokeObjectURL(url);
         }
 
+        // ------------------------------------------------------------------
+        // 7. Form submission flow
+        //
+        // The server decides whether a revocation warning is needed: it only
+        // renders the confirmation when an active certificate actually exists.
+        // ------------------------------------------------------------------
+        function submitCSR() {
+            const form = document.getElementById('csr-sign-form');
+            if (!form.reportValidity()) return;
+            document.getElementById('confirm-revoke-input').value = 'false';
+            htmx.trigger(form, 'submit');
+        }
+
+        function confirmRevocationAndSubmit() {
+            const form = document.getElementById('csr-sign-form');
+            document.getElementById('confirm-revoke-input').value = 'true';
+            document.getElementById('response-area').innerHTML = '';
+            htmx.trigger(form, 'submit');
+        }
+
+        function cancelRevocation() {
+            document.getElementById('response-area').innerHTML = '';
+        }
+
+        // ------------------------------------------------------------------
+        // 8. HTMX response handling: always swap error fragments into the
+        //    response area so validation problems stay visible.
+        // ------------------------------------------------------------------
+        document.addEventListener('htmx:beforeSwap', (evt) => {
+            if (evt.detail.xhr && evt.detail.xhr.status >= 400) {
+                evt.detail.shouldSwap = true;
+                evt.detail.isError = false;
+            }
+        });
+
         document.addEventListener('DOMContentLoaded', () => {
             if (document.getElementById('csr-input')) {
                 setupFileZone('csr-input', 'csr-zone', 'csr-text', 'csr-icon', '.csr files');
@@ -217,40 +235,55 @@
                 setupFileZone('int-input', 'int-zone', 'int-text', 'int-icon', '.crt, .pem files');
             }
         });
-
     </script>
 </head>
 
-<body
-    class="bg-slate-50 dark:bg-slate-900 min-h-screen font-sans text-slate-800 dark:text-slate-100 transition-colors duration-200 flex flex-col">
+<body class="app-bg bg-slate-50 dark:bg-slate-900 min-h-screen font-sans text-slate-800 dark:text-slate-100 transition-colors duration-200 flex flex-col">
 
-    <!-- TOP NAVIGATION BAR -->
-    <nav class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 shadow-sm sticky top-0 z-50">
+    <!-- TOP NAVIGATION -->
+    <nav class="sticky top-0 z-50 border-b border-slate-200/70 dark:border-slate-700/70 bg-white/80 dark:bg-slate-800/80 backdrop-blur-md shadow-sm">
         <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex justify-between h-14 items-center">
-                <!-- Left: Logo / Title -->
-                <div class="flex-shrink-0 flex items-center">
-                    <svg class="w-6 h-6 text-blue-600 dark:text-blue-400 mr-2" fill="none" stroke="currentColor"
-                        viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                            d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z">
-                        </path>
-                    </svg>
-                    <span class="font-bold text-lg text-slate-900 dark:text-white hidden sm:block">{{.UITitle}}</span>
-                    <span class="font-bold text-lg text-slate-900 dark:text-white sm:hidden">{{.UIShortTitle}}</span>
-                </div>
+                <a href="/" aria-label="{{.UITitle}} — home"
+                    class="flex-shrink-0 flex items-center gap-2.5 rounded-lg -m-1 p-1 transition hover:opacity-80">
+                    <span class="logo-chip">
+                        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                        </svg>
+                    </span>
+                    <span class="font-bold text-lg text-slate-900 dark:text-white hidden sm:block tracking-tight">{{.UITitle}}</span>
+                    <span class="font-bold text-lg text-slate-900 dark:text-white sm:hidden tracking-tight">{{.UIShortTitle}}</span>
+                </a>
 
-                <!-- Right: Profile, Theme Toggle & Logout -->
                 <div class="flex items-center space-x-3 sm:space-x-4">
                     {{if .IsLoggedIn}}
-                    <div
-                        class="flex items-center bg-slate-100 dark:bg-slate-700 rounded-full py-1 px-3 border border-slate-200 dark:border-slate-600">
+                    {{if .CertificatesEnabled}}
+                    <a href="/certs"
+                        class="hidden sm:inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 px-2.5 py-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700/60 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        Certificates
+                    </a>
+                    {{end}}
+                    {{if .ManualAvailable}}
+                    <button type="button" onclick="document.getElementById('manual-modal').classList.remove('hidden')"
+                        class="hidden sm:inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 px-2.5 py-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700/60 transition cursor-pointer">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                        </svg>
+                        Manual
+                    </button>
+                    {{end}}
+                    <div class="flex items-center bg-slate-100/80 dark:bg-slate-700/80 rounded-full py-1 px-3 border border-slate-200 dark:border-slate-600">
                         <div
-                            class="h-6 w-6 rounded-full bg-blue-600 text-white flex items-center justify-center text-xs font-bold uppercase mr-2">
+                            class="h-6 w-6 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex items-center justify-center text-xs font-bold uppercase mr-2 shadow-sm">
                             {{printf "%.1s" .UserIdentity}}
                         </div>
-                        <span
-                            class="text-sm font-medium text-slate-700 dark:text-slate-200 truncate max-w-[120px] sm:max-w-[200px]">
+                        <span class="text-sm font-medium text-slate-700 dark:text-slate-200 truncate max-w-[120px] sm:max-w-[200px]">
                             {{.UserIdentity}}
                         </span>
                     </div>
@@ -272,7 +305,7 @@
 
                     {{if .IsLoggedIn}}
                     <a href="/logout"
-                        class="text-sm font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 transition ml-2">Logout</a>
+                        class="text-sm font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 transition ml-1">Logout</a>
                     {{end}}
                 </div>
             </div>
@@ -280,79 +313,79 @@
     </nav>
 
     {{if .IsLoggedIn}}
-    <!-- MAIN CONTENT AREA (GRID LAYOUT) -->
-    <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-6 w-full">
+    <!-- MAIN CONTENT -->
+    <main class="flex-1 animate-fade-in">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
 
-        <div class="mb-6">
-            <h2 class="text-2xl font-bold text-slate-900 dark:text-white">Certificate Issuance</h2>
-            <p class="text-slate-600 dark:text-slate-300 text-sm mt-1">Generate a cryptographic key inside your YubiKey
-                and upload the attestation chain.</p>
-        </div>
+            <!-- HERO -->
+            <div class="mb-8">
+                <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 text-[11px] font-bold text-blue-700 dark:text-blue-300 uppercase tracking-wide mb-3">
+                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    Hardware attested issuance
+                </div>
+                <h1 class="text-3xl font-extrabold tracking-tight gradient-text">Certificate Issuance</h1>
+                <p class="text-slate-600 dark:text-slate-300 text-sm mt-2">
+                    Generate a key inside your YubiKey, prove its hardware origin with PIV attestation and receive a Vault-signed client certificate for <span class="font-mono font-bold text-slate-900 dark:text-white">CN={{.CertCN}}</span>.
+                </p>
+            </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
 
-            <!-- LEFT COLUMN: INSTRUCTIONS (Step 1 & 2) -->
-            <div class="lg:col-span-7 space-y-6 flex flex-col">
+                <!-- LEFT COLUMN: STEPS 1 & 2 -->
+                <div class="lg:col-span-7 space-y-6 flex flex-col">
 
-                <!-- STEP 1 -->
-                <div
-                    class="p-5 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
-                    <h2 class="text-base font-bold mb-3 text-slate-900 dark:text-white">Step 1: Install YubiKey Manager
-                    </h2>
-                    <div class="flex border-b border-slate-300 dark:border-slate-700 mb-4">
-                        <button id="btn-win" onclick="switchTab('win')"
-                            class="os-tab-btn px-4 py-1.5 border-b-2 font-medium text-sm border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 cursor-pointer">Windows</button>
-                        <button id="btn-mac" onclick="switchTab('mac')"
-                            class="os-tab-btn px-4 py-1.5 border-b-2 font-medium text-sm border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer">macOS</button>
-                        <button id="btn-lin" onclick="switchTab('lin')"
-                            class="os-tab-btn px-4 py-1.5 border-b-2 font-medium text-sm border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer">Linux</button>
-                    </div>
+                    <!-- STEP 1 -->
+                    <section class="panel">
+                        <header class="panel-head">
+                            <span class="step-num">1</span>
+                            <div>
+                                <h2 class="text-base font-bold text-slate-900 dark:text-white">Install YubiKey Manager</h2>
+                                <p class="text-xs text-slate-500 dark:text-slate-400">The <code class="code-inline">ykman</code> CLI drives your YubiKey.</p>
+                            </div>
+                        </header>
 
-                    <div id="tab-win" class="os-tab-content">
-                        <div class="relative group">
-                            <button onclick="copyToClipboard(this, 'code-win')"
-                                class="absolute top-2 right-2 p-1.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
-                                title="Copy code">
-                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z">
-                                    </path>
-                                </svg>
-                            </button>
-                            <code id="code-win"
-                                class="block bg-slate-100 dark:bg-slate-900 text-green-600 dark:text-green-400 p-2.5 pr-10 rounded-lg text-xs font-mono border border-slate-200 dark:border-slate-800">winget install Yubico.YubiKeyManager</code>
+                        <div class="flex border-b border-slate-200 dark:border-slate-700 mb-4">
+                            <button id="btn-win" onclick="switchTab('win')"
+                                class="os-tab-btn px-4 py-1.5 border-b-2 font-medium text-sm border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 cursor-pointer">Windows</button>
+                            <button id="btn-mac" onclick="switchTab('mac')"
+                                class="os-tab-btn px-4 py-1.5 border-b-2 font-medium text-sm border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer">macOS</button>
+                            <button id="btn-lin" onclick="switchTab('lin')"
+                                class="os-tab-btn px-4 py-1.5 border-b-2 font-medium text-sm border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer">Linux</button>
                         </div>
-                    </div>
 
-                    <div id="tab-mac" class="os-tab-content hidden">
-                        <div class="relative group">
-                            <button onclick="copyToClipboard(this, 'code-mac')"
-                                class="absolute top-2 right-2 p-1.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
-                                title="Copy code">
-                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z">
-                                    </path>
-                                </svg>
-                            </button>
-                            <code id="code-mac"
-                                class="block bg-slate-100 dark:bg-slate-900 text-green-600 dark:text-green-400 p-2.5 pr-10 rounded-lg text-xs font-mono border border-slate-200 dark:border-slate-800">brew install ykman</code>
+                        <div id="tab-win" class="os-tab-content">
+                            <div class="relative group code-wrap">
+                                <button onclick="copyToClipboard(this, 'code-win')" class="copy-btn" title="Copy code">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                    </svg>
+                                </button>
+                                <code id="code-win" class="code-block">winget install Yubico.YubiKeyManager</code>
+                            </div>
                         </div>
-                    </div>
 
-                    <div id="tab-lin" class="os-tab-content hidden">
-                        <div class="relative group">
-                            <button onclick="copyToClipboard(this, 'code-lin')"
-                                class="absolute top-2 right-2 p-1.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
-                                title="Copy code">
-                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z">
-                                    </path>
-                                </svg>
-                            </button>
-                            <pre id="code-lin"
-                                class="block bg-slate-100 dark:bg-slate-900 text-green-600 dark:text-green-400 p-3 pr-10 rounded-lg text-xs font-mono border border-slate-200 dark:border-slate-800 overflow-x-auto whitespace-pre-wrap"># Debian / Ubuntu
+                        <div id="tab-mac" class="os-tab-content hidden">
+                            <div class="relative group code-wrap">
+                                <button onclick="copyToClipboard(this, 'code-mac')" class="copy-btn" title="Copy code">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                    </svg>
+                                </button>
+                                <code id="code-mac" class="code-block">brew install ykman</code>
+                            </div>
+                        </div>
+
+                        <div id="tab-lin" class="os-tab-content hidden">
+                            <div class="relative group code-wrap">
+                                <button onclick="copyToClipboard(this, 'code-lin')" class="copy-btn" title="Copy code">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                    </svg>
+                                </button>
+                                <pre id="code-lin" class="code-block whitespace-pre-wrap"># Debian / Ubuntu
 sudo apt install yubikey-manager
 
 # Fedora / RHEL
@@ -360,221 +393,195 @@ sudo dnf install yubikey-manager
 
 # Arch Linux
 sudo pacman -S yubikey-manager</pre>
+                            </div>
                         </div>
-                    </div>
-                </div>
+                    </section>
 
-                <!-- STEP 2 -->
-                <div
-                    class="p-5 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
-                    <div class="flex items-center justify-between mb-2">
-                        <h2 class="text-base font-bold text-slate-900 dark:text-white">Step 2: Generate Key &
-                            Attestation</h2>
-                    </div>
-                    <p class="text-xs text-slate-600 dark:text-slate-300 mb-3">Select PIV slot and run these exact
-                        commands in terminal:</p>
+                    <!-- STEP 2 -->
+                    <section class="panel">
+                        <header class="panel-head">
+                            <span class="step-num">2</span>
+                            <div>
+                                <h2 class="text-base font-bold text-slate-900 dark:text-white">Generate Key &amp; Attestation</h2>
+                                <p class="text-xs text-slate-500 dark:text-slate-400">Pick a PIV slot and key type, then run these exact commands.</p>
+                            </div>
+                        </header>
 
-                    <!-- Slot Selector Toggle -->
-                    <div class="flex border-b border-slate-300 dark:border-slate-700 mb-3">
-                        <button id="btn-slot-9a" onclick="switchSlot('9a')"
-                            class="slot-tab-btn px-3 py-1.5 border-b-2 font-medium text-xs border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 cursor-pointer">Slot
-                            9a (Authentication)</button>
-                        <button id="btn-slot-9c" onclick="switchSlot('9c')"
-                            class="slot-tab-btn px-3 py-1.5 border-b-2 font-medium text-xs border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer">Slot
-                            9c (Digital Signature)</button>
-                    </div>
+                        <!-- Slot selector -->
+                        <p class="label-sm">PIV slot</p>
+                        <div class="flex border-b border-slate-200 dark:border-slate-700 mb-3 -mt-1">
+                            <button id="btn-slot-9a" onclick="switchSlot('9a')"
+                                class="slot-tab-btn px-3 py-1.5 border-b-2 font-medium text-xs border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 cursor-pointer">Slot
+                                9a (Authentication)</button>
+                            <button id="btn-slot-9c" onclick="switchSlot('9c')"
+                                class="slot-tab-btn px-3 py-1.5 border-b-2 font-medium text-xs border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer">Slot
+                                9c (Digital Signature)</button>
+                        </div>
 
-                    <div class="relative group">
-                        <button onclick="copyToClipboard(this, 'code-gen')"
-                            class="absolute top-3 right-3 p-2 rounded-md bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
-                            title="Copy code">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z">
-                                </path>
-                            </svg>
-                        </button>
-                        <pre id="code-gen" data-rsa-bits="{{if eq .RSABits 2048}}2048{{else}}3072{{end}}"
-                            data-user-identity="{{.UserIdentity}}"
-                            class="block bg-slate-100 dark:bg-slate-900 text-green-600 dark:text-green-400 p-4 pr-12 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap border border-slate-200 dark:border-slate-800">
-# 1. Generate RSA {{if eq .RSABits 2048}}2048{{else}}3072{{end}} key pair in slot 9a
-ykman piv keys generate 9a public.pem -a RSA{{if eq .RSABits 2048}}2048{{else}}3072{{end}}
+                        {{if not .SingleKeyType}}
+                        <!-- Key type selector -->
+                        <p class="label-sm">Key type</p>
+                        <div class="flex flex-wrap gap-2 mb-4 -mt-1">
+                            {{range $i, $kt := .KeyTypes}}
+                            <button id="btn-keytype-{{$kt.Name}}" onclick="switchKeyType('{{$kt.Name}}')"
+                                title="{{$kt.Detail}}"
+                                class="keytype-tab-btn px-3 py-1.5 rounded-lg border text-xs font-semibold cursor-pointer transition {{if eq $i 0}}border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30{{else}}border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:border-slate-300 dark:hover:border-slate-600{{end}}">
+                                <span class="flex flex-col items-start leading-tight">
+                                    <span>{{$kt.Label}}</span>
+                                    <span class="text-[10px] font-normal opacity-70">{{$kt.Detail}}</span>
+                                </span>
+                            </button>
+                            {{end}}
+                        </div>
+                        {{end}}
 
-# 2. Create the Certificate Signing Request (CSR)
-ykman piv certificates request 9a public.pem user.csr -s "CN={{.UserIdentity}}"
+                        <div class="relative group code-wrap">
+                            <button onclick="copyToClipboard(this, 'code-gen')" class="copy-btn copy-btn-lg" title="Copy code">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                </svg>
+                            </button>
+                            <pre id="code-gen" class="code-block p-4 pr-12"># 1. Generate the {{with .KeyTypes}}{{(index . 0).Label}}{{else}}RSA 3072{{end}} key pair in slot 9a
+ykman piv keys generate 9a public.pem -a {{with .KeyTypes}}{{(index . 0).Ykman}}{{else}}RSA3072{{end}}
+
+# 2. Create the Certificate Signing Request for CN={{.CertCN}}
+ykman piv certificates request 9a public.pem user.csr -s "CN={{.CertCN}}"
 
 # 3. Create the hardware attestation certificate
 ykman piv keys attest 9a attest.crt
 
-# 4. Export the Yubico Intermediate certificate
+# 4. Export the Yubico intermediate certificate
 ykman piv certificates export f9 intermediate.crt</pre>
-                    </div>
-                </div>
-            </div>
-
-            <!-- RIGHT COLUMN: FORM (Step 3) -->
-            <div class="lg:col-span-5 flex flex-col">
-                <div
-                    class="p-5 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm flex-1 flex flex-col">
-                    <h2 class="text-base font-bold mb-5 text-slate-900 dark:text-white">Step 3: Upload & Sign</h2>
-
-                    <form id="csr-sign-form" hx-post="/api/sign-csr" hx-encoding="multipart/form-data"
-                        hx-target="#response-area" hx-indicator="#spinner"
-                        data-revoke-existing="{{if .RevokeExisting}}true{{else}}false{{end}}"
-                        class="flex-1 flex flex-col">
-
-                        <!-- HIDDEN FIELD FOR THE SLOT -->
-                        <input type="hidden" name="slot" id="selected-slot-input" value="9a" />
-
-                        <!-- Fields -->
-                        <div class="space-y-4 flex-1">
-                            <!-- Compact Zone 1: CSR -->
-                            <div>
-                                <label
-                                    class="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase mb-1.5">1.
-                                    CSR (user.csr)</label>
-                                <label id="csr-zone"
-                                    class="flex items-center w-full h-16 px-4 border-2 border-slate-300 border-dashed rounded-lg cursor-pointer bg-slate-50 dark:bg-slate-900/50 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors group">
-                                    <svg id="csr-icon"
-                                        class="w-6 h-6 text-slate-400 mr-3 flex-shrink-0 group-hover:text-blue-500 transition-colors"
-                                        fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                            d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12">
-                                        </path>
-                                    </svg>
-                                    <div id="csr-text" class="flex-1 min-w-0 overflow-hidden text-left text-ellipsis">
-                                        <p class="text-sm text-slate-500 dark:text-slate-400 truncate"><span
-                                                class="font-semibold text-blue-600 dark:text-blue-400">Click to
-                                                upload</span> or drag</p>
-                                        <p class="text-xs text-slate-400 dark:text-slate-500">.csr files only</p>
-                                    </div>
-                                    <input id="csr-input" type="file" name="csr" class="hidden" required
-                                        accept=".csr" />
-                                </label>
-                            </div>
-
-                            <!-- Compact Zone 2: Attestation -->
-                            <div>
-                                <label
-                                    class="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase mb-1.5">2.
-                                    Attestation (attest.crt)</label>
-                                <label id="attest-zone"
-                                    class="flex items-center w-full h-16 px-4 border-2 border-slate-300 border-dashed rounded-lg cursor-pointer bg-slate-50 dark:bg-slate-900/50 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors group">
-                                    <svg id="attest-icon"
-                                        class="w-6 h-6 text-slate-400 mr-3 flex-shrink-0 group-hover:text-blue-500 transition-colors"
-                                        fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                            d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z">
-                                        </path>
-                                    </svg>
-                                    <div id="attest-text"
-                                        class="flex-1 min-w-0 overflow-hidden text-left text-ellipsis">
-                                        <p class="text-sm text-slate-500 dark:text-slate-400 truncate"><span
-                                                class="font-semibold text-blue-600 dark:text-blue-400">Click to
-                                                upload</span> or drag</p>
-                                        <p class="text-xs text-slate-400 dark:text-slate-500">.crt, .pem files</p>
-                                    </div>
-                                    <input id="attest-input" type="file" name="attest" class="hidden" required
-                                        accept=".crt,.pem,.cer" />
-                                </label>
-                            </div>
-
-                            <!-- Compact Zone 3: Intermediate -->
-                            <div>
-                                <label
-                                    class="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase mb-1.5">3.
-                                    Intermediate (intermediate.crt)</label>
-                                <label id="int-zone"
-                                    class="flex items-center w-full h-16 px-4 border-2 border-slate-300 border-dashed rounded-lg cursor-pointer bg-slate-50 dark:bg-slate-900/50 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors group">
-                                    <svg id="int-icon"
-                                        class="w-6 h-6 text-slate-400 mr-3 flex-shrink-0 group-hover:text-blue-500 transition-colors"
-                                        fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                            d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10">
-                                        </path>
-                                    </svg>
-                                    <div id="int-text" class="flex-1 min-w-0 overflow-hidden text-left text-ellipsis">
-                                        <p class="text-sm text-slate-500 dark:text-slate-400 truncate"><span
-                                                class="font-semibold text-blue-600 dark:text-blue-400">Click to
-                                                upload</span> or drag</p>
-                                        <p class="text-xs text-slate-400 dark:text-slate-500">.crt, .pem files</p>
-                                    </div>
-                                    <input id="int-input" type="file" name="intermediate" class="hidden" required
-                                        accept=".crt,.pem,.cer" />
-                                </label>
-                            </div>
                         </div>
+                    </section>
+                </div>
 
-                        <!-- Use type="button" to prevent native form submission, and call our JS function instead -->
-                        <button type="button" onclick="checkRevoke()"
-                            class="w-full mt-auto bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-3 px-4 rounded-lg transition shadow-sm cursor-pointer">
-                            Verify & Issue Certificate
-                        </button>
-                    </form>
+                <!-- RIGHT COLUMN: FORM (Step 3) -->
+                <div class="lg:col-span-5 flex flex-col">
+                    <section class="panel flex-1 flex flex-col">
+                        <header class="panel-head mb-5">
+                            <span class="step-num">3</span>
+                            <div>
+                                <h2 class="text-base font-bold text-slate-900 dark:text-white">Upload &amp; Sign</h2>
+                                <p class="text-xs text-slate-500 dark:text-slate-400">Three files, verified against the Yubico root CAs.</p>
+                            </div>
+                        </header>
 
-                    <div id="spinner"
-                        class="htmx-indicator mt-4 text-center text-xs text-blue-600 dark:text-blue-400 font-medium">
-                        <svg class="animate-spin inline-block h-4 w-4 mr-1 border-t-2 border-b-2 border-blue-600 dark:border-blue-400 rounded-full"
-                            viewBox="0 0 24 24"></svg>
-                        Verifying Yubico Root CA...
-                    </div>
-                    <div id="response-area" class="mt-4"></div>
+                        <form id="csr-sign-form" hx-post="/api/sign-csr" hx-encoding="multipart/form-data"
+                            hx-target="#response-area" hx-swap="innerHTML" hx-indicator="#spinner"
+                            hx-disabled-elt="#submit-btn"
+                            class="flex-1 flex flex-col">
+
+                            <input type="hidden" name="slot" id="selected-slot-input" value="9a" />
+                            <input type="hidden" name="key_type" id="selected-keytype-input" value="{{with .KeyTypes}}{{(index . 0).Name}}{{end}}" />
+                            <input type="hidden" name="confirm_revoke" id="confirm-revoke-input" value="false" />
+
+                            <div class="space-y-4 flex-1">
+                                <!-- CSR -->
+                                <div>
+                                    <label class="label-sm">1. CSR (user.csr)</label>
+                                    <label id="csr-zone" class="dropzone">
+                                        <svg id="csr-icon" class="dropzone-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12">
+                                            </path>
+                                        </svg>
+                                        <div id="csr-text" class="dropzone-text">
+                                            <p class="text-sm text-slate-500 dark:text-slate-400 truncate"><span
+                                                    class="font-semibold text-blue-600 dark:text-blue-400">Click to
+                                                    upload</span> or drag</p>
+                                            <p class="text-xs text-slate-400 dark:text-slate-500">.csr files only</p>
+                                        </div>
+                                        <input id="csr-input" type="file" name="csr" class="hidden" required accept=".csr" />
+                                    </label>
+                                </div>
+
+                                <!-- Attestation -->
+                                <div>
+                                    <label class="label-sm">2. Attestation (attest.crt)</label>
+                                    <label id="attest-zone" class="dropzone">
+                                        <svg id="attest-icon" class="dropzone-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z">
+                                            </path>
+                                        </svg>
+                                        <div id="attest-text" class="dropzone-text">
+                                            <p class="text-sm text-slate-500 dark:text-slate-400 truncate"><span
+                                                    class="font-semibold text-blue-600 dark:text-blue-400">Click to
+                                                    upload</span> or drag</p>
+                                            <p class="text-xs text-slate-400 dark:text-slate-500">.crt, .pem files</p>
+                                        </div>
+                                        <input id="attest-input" type="file" name="attest" class="hidden" required accept=".crt,.pem,.cer" />
+                                    </label>
+                                </div>
+
+                                <!-- Intermediate -->
+                                <div>
+                                    <label class="label-sm">3. Intermediate (intermediate.crt)</label>
+                                    <label id="int-zone" class="dropzone">
+                                        <svg id="int-icon" class="dropzone-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10">
+                                            </path>
+                                        </svg>
+                                        <div id="int-text" class="dropzone-text">
+                                            <p class="text-sm text-slate-500 dark:text-slate-400 truncate"><span
+                                                    class="font-semibold text-blue-600 dark:text-blue-400">Click to
+                                                    upload</span> or drag</p>
+                                            <p class="text-xs text-slate-400 dark:text-slate-500">.crt, .pem files</p>
+                                        </div>
+                                        <input id="int-input" type="file" name="intermediate" class="hidden" required accept=".crt,.pem,.cer" />
+                                    </label>
+                                </div>
+
+                            </div>
+
+                            <button id="submit-btn" type="button" onclick="submitCSR()" class="btn-primary mt-6">
+                                Verify &amp; Issue Certificate
+                            </button>
+                        </form>
+
+                        <div id="spinner" class="htmx-indicator mt-4 text-center text-xs text-blue-600 dark:text-blue-400 font-medium">
+                            <svg class="animate-spin inline-block h-4 w-4 mr-1 border-t-2 border-b-2 border-blue-600 dark:border-blue-400 rounded-full"
+                                viewBox="0 0 24 24"></svg>
+                            Verifying Yubico Root CA chain&hellip;
+                        </div>
+                        <div id="response-area" class="mt-4"></div>
+                    </section>
                 </div>
             </div>
-
         </div>
-    </div>
+    </main>
 
-    <!-- REVOCATION WARNING MODAL -->
-    <div id="revoke-warning-modal"
-        class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm animate-fade-in">
-        <div
-            class="bg-white dark:bg-slate-800 border border-amber-300 dark:border-amber-700/60 rounded-2xl shadow-2xl max-w-md w-full p-6 relative flex flex-col">
-            <div class="flex items-start space-x-3 mb-4">
-                <div
-                    class="w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-900/50 flex items-center justify-center text-amber-600 dark:text-amber-400 flex-shrink-0">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z">
-                        </path>
-                    </svg>
-                </div>
-                <div>
-                    <h3 class="text-base font-bold text-slate-900 dark:text-white">Existing Certificate Revocation</h3>
-                    <p class="text-xs text-slate-600 dark:text-slate-300 mt-1 leading-relaxed">
-                        Issuing a new certificate will <span
-                            class="font-bold text-amber-600 dark:text-amber-400">immediately revoke</span> any existing
-                        certificate issued for <span
-                            class="font-bold text-slate-900 dark:text-white">{{.UserIdentity}}</span>.
-                    </p>
-                    <p class="text-xs text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
-                        If you do not import the new certificate into your YubiKey, your active VPN connection will be
-                        terminated within a few hours.
-                    </p>
-                </div>
-            </div>
+    {{template "manual_modal" .}}
 
-            <div class="flex items-center justify-end space-x-3 pt-3 border-t border-slate-200 dark:border-slate-700">
-                <button onclick="cancelRevocation()" type="button"
-                    class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-bold rounded-lg transition cursor-pointer">
-                    Cancel
-                </button>
-                <button onclick="confirmRevocationAndSubmit()" type="button"
-                    class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer">
-                    Proceed & Revoke
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <!-- LOGIN PAGE (Shown when not logged in) -->
     {{else}}
-    <div class="flex-1 flex items-center justify-center p-4">
-        <a href="/login"
-            class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-lg transition shadow-md">
-            Login with SSO
-        </a>
-    </div>
+    <!-- LOGIN -->
+    <main class="flex-1 flex items-center justify-center p-6 animate-fade-in">
+        <div class="login-card w-full max-w-sm text-center">
+            <span class="logo-chip logo-chip-lg mx-auto">
+                <svg class="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
+            </span>
+            <h1 class="text-xl font-bold text-slate-900 dark:text-white mt-4 tracking-tight">{{.UITitle}}</h1>
+            <p class="text-sm text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
+                Sign in with your organisation account to request a hardware-attested client certificate.
+            </p>
+            <a href="/login" class="btn-primary w-full mt-6 inline-flex items-center justify-center gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1" />
+                </svg>
+                Login with SSO
+            </a>
+            <p class="text-[11px] text-slate-400 dark:text-slate-500 mt-4">
+                Certificates are only issued for keys generated inside a YubiKey.
+            </p>
+        </div>
+    </main>
     {{end}}
 </body>
 

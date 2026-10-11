@@ -1,6 +1,6 @@
 # YubiVault
 
-YubiVault is an airgapped **Validation Middleware & Vault Delegation Proxy** for issuing OpenVPN client certificates. It enforces hardware-backed cryptographic origin by verifying that a Certificate Signing Request (CSR) was generated directly inside a physical YubiKey (Slot `9a` or `9c`) using YubiKey PIV Attestation before delegating the signing request to HashiCorp Vault / OpenBao.
+YubiVault is an airgapped **Validation Middleware & Vault Delegation Proxy** for signing and issueing certificates. It enforces hardware-backed cryptographic origin by verifying that a Certificate Signing Request (CSR) was generated directly inside a physical YubiKey (Slot `9a` or `9c`) using YubiKey PIV Attestation before delegating the signing request to HashiCorp Vault / OpenBao.
 
 ---
 
@@ -157,17 +157,44 @@ EOF
 
 ## Configuration (`config.yaml`)
 
-Create `config.yaml` in the project root or `/etc/yubivault/config.yaml`:
+Create `config.yaml` in the project root or `/etc/yubivault/config.yaml`. A
+fully commented reference lives in `config.yaml.example`; omitted options fall
+back to the defaults noted below.
 
 ```yaml
 server:
   listen_addr: "127.0.0.1:8080"
+  # Must be at least 32 characters and must NOT be this example value
+  # (the server refuses to start with the placeholder). Generate one with:
+  #   openssl rand -base64 48
   session_secret: "super-secret-32-byte-key-here!!"
-  # debug: true -> defaults to false
+  # debug: true -> defaults to false (verbose logging)
+  # cookie_secure: true -> defaults to true. Set false only for plain HTTP
+  #   local development, never in production.
+  # rate_limit_login_per_min: 10 -> defaults to 10 (per client IP)
+  # rate_limit_sign_per_min: 10  -> defaults to 10 (per client IP)
 
 ui:
   title: "YubiVault Portal"
   short_title: "YBV"
+  # certificates_enabled: true -> defaults to true. Set false to hide the
+  #   /certs certificate inventory page and its navigation link.
+  # Optional manuals. All manuals and the media (images) they reference live in
+  #   one directory so relative image paths just work:
+  #     manuals/manual-macos.md
+  #     manuals/manual-windows.pdf
+  #     manuals/images/step1.png     # referenced as ![step](images/step1.png)
+  #   The visitor's OS is preselected from the User-Agent. Manuals are shown in
+  #   a lightbox with one tab per OS; media is served from /manual/asset/.
+  # manual_dir: "manuals"
+  # manuals:
+  #   macos: "manual-macos.md"
+  #   windows: "manual-windows.md"
+  #   linux: "manual-linux.md"
+  # manual_file: "manual.md" -> optional single fallback manual, shown for any
+  #   OS that has no specific entry above. Omit manuals and manual_file to hide
+  #   the manual entirely. All of the above are resolved relative to
+  #   manual_dir unless absolute.
 
 vault:
   address: "https://vault.example.com"
@@ -176,7 +203,15 @@ vault:
   auth_mount: "jwt-yubivault"
   auth_role: "yubivault-middleware"
   # revoke_existing: true -> defaults to false
-  # Below settings are needed to revoke
+  # revoke_mode: "strict" -> defaults to "strict". One of:
+  #   strict       fail the request if the revocation check fails (safe default)
+  #   best_effort  log and continue when the revocation check fails
+  # Optional: set a TTL on issued certificates. Omit to inherit the Vault role's
+  # default. These are NOT user controllable.
+  # cert_ttl: "720h"       # 30 days
+  # cert_ttl_max: "8760h"  # 1 year ceiling
+  # AppRole credentials are REQUIRED when revoke_existing is enabled and are also
+  # used to power the /certs inventory page.
   # approle_mount: "approle"
   # approle_role_id: "YOUR_ROLE_ID_HERE"
   # approle_secret_id: "YOUR_SECRET_ID_HERE"
@@ -185,11 +220,30 @@ oidc:
   issuer: "https://idp.example.com/realms/master"
   client_id: "yubivault"
   client_secret: "your-oidc-client-secret"
-  redirect_url: "https://reverse.published.url.example.com/callback"
+  # Public, reverse-proxied URL of the portal (https, no port). Must match the
+  # redirect URI registered at your IdP exactly.
+  redirect_url: "https://yubivault.example.com/callback"
+  # logout_redirect_uri: "https://yubivault.example.com/"  # optional, requires IdP support
 
 yubico:
+  # PEM bundle with the Yubico PIV root CAs. Fails closed if missing or empty.
   root_ca_file: "yubico-roots.pem"
-  # rsa_bits: 2048 -> defaults to 3072
+  # The administrator decides which key types users may pick from in the UI.
+  # key_types: ["rsa3072", "eccp256"]  # defaults to ["rsa3072"]
+  # Supported: rsa2048, rsa3072, rsa4096, eccp256, eccp384
+  # strict_slot_check: true -> defaults to true. Requires the attestation
+  #   subject to name the PIV slot the user selected.
+  # rsa_bits: 3072  # legacy single-type setting, superseded by key_types
+
+logging:
+  # Directory for log files. Defaults to /var/log/yubivault. Set to "" to log
+  # to stderr/journald only (no log file, no logrotate snippet).
+  # dir: "/var/log/yubivault"
+  # file: "yubivault.log"
+  # owner: "yubivault"
+  # group: "yubivault"
+  # `yubivault --install` creates the directory and file with these
+  # permissions/ownership and writes /etc/logrotate.d/yubivault.
 ```
 
 ---
@@ -233,14 +287,19 @@ vault write pki_int/roles/yubivault \
 
 *(Note: Replace `auth_jwt_0429de2e` with your Vault JWT auth mount accessor ID obtained via `vault auth list`).*
 
-### 3. Vault Policy (`pol-testers`)
+### 3. Vault Policy
 
 Ensure the Vault policy allows signing, listing, reading, and revoking certificates:
 
 ```hcl
+# pol-yubivault-user.hcl
 path "pki_int/sign/yubivault" {
   capabilities = ["update"]
 }
+```
+
+```shell
+vault policy write pol-yubivault-user pol-yubivault-user.hcl
 ```
 
 ### 4. Revocation
@@ -394,7 +453,7 @@ server {
 }
 ```
 
-#### Traefik (Docker Dynamic Configuration)
+#### Traefik
 
 ```yaml
 http:

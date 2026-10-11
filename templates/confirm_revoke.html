@@ -1,0 +1,57 @@
+<div class="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in">
+    <!-- Backdrop -->
+    <div class="absolute inset-0 bg-slate-900/60 dark:bg-slate-900/80 backdrop-blur-sm" onclick="cancelRevocation()"></div>
+
+    <!-- Modal -->
+    <div class="relative w-full max-w-md bg-white dark:bg-slate-800 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+        <!-- Header -->
+        <div class="relative px-6 pt-6 pb-4 bg-gradient-to-br from-amber-50 to-orange-50 dark:from-amber-900/20 dark:to-orange-900/20 border-b border-amber-100 dark:border-amber-800/40">
+            <div class="flex items-center gap-3">
+                <span class="flex-shrink-0 h-10 w-10 rounded-full bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center">
+                    <svg class="w-5 h-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"
+                            d="M12 9v2m0 4h.01M5.07 19h13.86a2 2 0 001.74-3L13.74 4a2 2 0 00-3.48 0L3.34 16a2 2 0 001.73 3z" />
+                    </svg>
+                </span>
+                <div>
+                    <h3 class="text-base font-bold text-slate-900 dark:text-white">Active certificate found</h3>
+                    <p class="text-xs text-slate-600 dark:text-slate-300">Confirm before revoking it.</p>
+                </div>
+            </div>
+            <button onclick="cancelRevocation()" aria-label="Close"
+                class="absolute top-4 right-4 p-1.5 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-white/60 dark:hover:bg-slate-700/60 transition cursor-pointer">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+        </div>
+
+        <!-- Body -->
+        <div class="px-6 py-4 space-y-3">
+            <p class="text-xs text-slate-700 dark:text-slate-300">
+                You already hold an active certificate for
+                <span class="font-mono font-bold text-slate-900 dark:text-white">CN={{.CertCN}}</span>.
+                Issuing a new one will
+                <span class="font-bold text-amber-700 dark:text-amber-400">immediately revoke</span>
+                the existing certificate.
+            </p>
+            <div class="rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700/60 p-3">
+                <p class="text-[11px] text-amber-800 dark:text-amber-300">
+                    Devices still trusting the old certificate will stop working until they use the new one.
+                </p>
+            </div>
+        </div>
+
+        <!-- Footer actions -->
+        <div class="px-6 pb-6 flex flex-col sm:flex-row gap-2">
+            <button type="button" onclick="confirmRevocationAndSubmit()"
+                class="flex-1 inline-flex items-center justify-center gap-2 text-sm font-bold px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white transition shadow-sm cursor-pointer">
+                Revoke &amp; issue new
+            </button>
+            <button type="button" onclick="cancelRevocation()"
+                class="flex-1 inline-flex items-center justify-center gap-2 text-sm font-bold px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700/60 transition cursor-pointer">
+                Cancel
+            </button>
+        </div>
+    </div>
+</div>
