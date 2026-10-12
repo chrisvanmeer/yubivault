@@ -41,6 +41,14 @@ YubiVault is an airgapped **Validation Middleware & Vault Delegation Proxy** for
   <img src="assets/ui_3.png" alt="UI Screenshot" width="100%">
 </p>
 
+<p align="center">
+  <img src="assets/ui_4.png" alt="UI Screenshot" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/ui_5.png" alt="UI Screenshot" width="100%">
+</p>
+
 ---
 
 ## Directory Structure
