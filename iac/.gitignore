@@ -1,0 +1,15 @@
+# Terraform / OpenTofu working files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Local variable files (may hold secrets); keep the committed examples.
+*.tfvars
+!*.tfvars.example
+
+# Generated rotation artefacts (CSR + signed intermediate).
+pki/generated/*
+!pki/generated/.gitkeep

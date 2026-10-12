@@ -1,0 +1,20 @@
+# Example variable file for the pki stack.
+#
+# Copy to terraform.tfvars (git-ignored) and adjust. The jwt_auth_accessor is
+# required; fetch it from the platform stack:
+#   terraform -chdir=../platform output -raw jwt_auth_accessor
+
+# config_file    = "../../config.yaml"
+# vault_address  = "https://vault.example.com"
+# pki_mount      = "pki_int"
+# pki_role       = "yubivault"
+# cert_ttl       = "720h"
+# cert_ttl_max   = "8760h"
+
+# jwt_auth_accessor = "auth_jwt_0123456789"
+
+# rotation_token = "2026-01-01T00:00:00Z"   # change to trigger a rotation
+
+# intermediate_common_name = "YubiVault Intermediate CA"
+# intermediate_key_type    = "rsa"
+# intermediate_key_bits    = 4096

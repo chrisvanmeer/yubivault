@@ -320,6 +320,12 @@ audit:
 
 Ensure Vault has the JWT auth backend enabled and configured to accept OIDC tokens from your provider, along with proper PKI permissions.
 
+> **IaC alternative:** the steps below can also be managed with OpenTofu or
+> Terraform. See [`iac/`](iac/README.md) for a two-stack setup that reads
+> `config.yaml`, includes a guided intermediate-CA rotation for the offline
+> root, and recreates the PKI role with the correct `allowed_domains` and
+> validity after every rotation.
+
 ### 1. Configure JWT Auth Engine
 
 ```bash

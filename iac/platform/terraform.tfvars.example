@@ -1,0 +1,27 @@
+# Example variable file for the platform stack.
+#
+# Copy to terraform.tfvars (git-ignored) and adjust. Everything here overrides
+# the value read from config.yaml, so you normally only need entries for values
+# that are NOT already in config.yaml.
+
+# config_file = "../../config.yaml"
+
+# vault_address   = "https://vault.example.com"
+# pki_mount       = "pki_int"
+# pki_role        = "yubivault"
+# auth_mount      = "jwt-yubivault"
+# auth_role       = "yubivault-middleware"
+# revoke_existing = true
+# approle_mount   = "approle"
+
+# oidc_issuer     = "https://idp.example.com/realms/master"
+# oidc_client_id  = "yubivault"
+# allowed_groups  = ["yubivault-users"]
+
+# jwt_user_claim            = "preferred_username"
+# sign_policy_prefix        = "pol-"
+# fallback_sign_policy_name = "pol-yubivault-user"
+# backend_policy_name       = "pol-yubivault-backend"
+# approle_role_name         = "yubivault-portal"
+# approle_token_ttl         = 3600
+# approle_token_max_ttl     = 14400
