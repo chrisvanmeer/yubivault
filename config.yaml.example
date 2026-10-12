@@ -1,3 +1,9 @@
+# YubiVault configuration.
+#
+# The file is watched at runtime: every 10 seconds it is re-read and, when its
+# contents changed, applied live without a restart. A reload is logged only when
+# a change is actually detected. The listen address and the log/audit
+# destinations require a restart to take effect.
 server:
   listen_addr: "127.0.0.1:8080"
   # Must be at least 32 characters and must NOT be this example value
@@ -9,6 +15,10 @@ server:
   #   local development, never in production.
   # rate_limit_login_per_min: 10 -> defaults to 10 (per client IP)
   # rate_limit_sign_per_min: 10  -> defaults to 10 (per client IP)
+  # Session lifetime. Both accept Go duration strings (e.g. "30m", "8h").
+  #   session_max_age: "1h"        # absolute lifetime; defaults to 1h
+  #   session_idle_timeout: "30m"  # logout after inactivity; defaults to 30m.
+  #                                # Must not exceed session_max_age.
 
 ui:
   title: "YubiVault Portal"
@@ -96,6 +106,17 @@ yubico:
   # strict_slot_check: true -> defaults to true. Requires the attestation
   #   subject to name the PIV slot the user selected.
   # rsa_bits: 3072  # legacy single-type setting, superseded by key_types
+  # Optional device policy. Both minima are fail-closed: when set, a YubiKey
+  # that does not report the value (or reports an older one) is rejected.
+  #   min_firmware: "5.4.3"  # require this firmware version or newer
+  #   min_serial: "1000000"  # require this serial number or higher
+  # Optional per-Common-Name device pinning. Each CN may map to one or more
+  # device fingerprints (as shown in the issuance preview and audit log). When
+  # a CN has an entry, only those exact devices can be issued a certificate;
+  # CNs without an entry accept any YubiKey.
+  # device_fingerprints:
+  #   chris:
+  #     - "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 audit:
   # Append-only JSONL audit trail of logins, certificate issuance, denials and

@@ -59,6 +59,12 @@
                     <span class="font-semibold text-slate-700 dark:text-slate-300">{{.YubiKeyFirmware}}</span>
                 </div>
                 {{end}}
+                {{if .YubiKeyFingerprint}}
+                <div class="flex items-center justify-between gap-3">
+                    <span class="text-slate-500 dark:text-slate-400 whitespace-nowrap">Device fingerprint</span>
+                    <span class="font-mono text-[10px] text-slate-500 dark:text-slate-400 truncate max-w-[200px]" title="{{.YubiKeyFingerprint}}">{{.YubiKeyFingerprint}}</span>
+                </div>
+                {{end}}
                 {{if .Issued}}
                 <div class="pt-1.5 border-t border-slate-200 dark:border-slate-700 text-[11px] text-emerald-700 dark:text-emerald-400">
                     {{.Issued}} previous certificate(s) were revoked.

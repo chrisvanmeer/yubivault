@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
 	"syscall"
 	"time"
 
@@ -35,11 +36,35 @@ func main() {
 	installFlag := flag.Bool("install", false, "Install YubiVault as a systemd service")
 	uninstallFlag := flag.Bool("uninstall", false, "Uninstall the YubiVault systemd service")
 	checkConfigFlag := flag.Bool("check-config", false, "Validate the configuration and its dependencies, then exit")
+	verifyAuditFlag := flag.Bool("verify-audit", false, "Verify the integrity of the audit trail's hash chain, then exit")
 	version := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
 
 	if *version {
 		fmt.Println("yubivault")
+		return
+	}
+
+	if *verifyAuditFlag {
+		cfg, err := config.Load(envOrDefault("CONFIG_FILE", "config.yaml"))
+		if err != nil {
+			slog.Error("configuration invalid", "error", err)
+			os.Exit(1)
+		}
+		if !cfg.AuditEnabled() {
+			fmt.Println("audit trail is disabled, nothing to verify")
+			return
+		}
+		path := cfg.AuditFilePath()
+		if path == "" {
+			slog.Error("audit verification failed", "error", "audit trail has no directory configured")
+			os.Exit(1)
+		}
+		if n, err := audit.Verify(path); err != nil {
+			slog.Error("audit trail verification failed", "line", n, "path", path, "error", err)
+			os.Exit(1)
+		}
+		fmt.Printf("audit trail OK: %s\n", path)
 		return
 	}
 
@@ -135,6 +160,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Poll config.yaml and hot-reload it in place. A reload is logged only when
+	// the configuration actually changed, so an unchanged file stays silent.
+	go watchConfig(ctx, configPath, cfg, p)
+
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("YubiVault portal listening",
@@ -167,6 +196,50 @@ func envOrDefault(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+// configReloadInterval is how often config.yaml is polled for changes. Polling
+// avoids platform-specific file watching and is cheap for a small file.
+const configReloadInterval = 10 * time.Second
+
+// watchConfig reloads config.yaml in place when it changes, without restarting
+// the process. It stays silent while the file is unchanged; an invalid file is
+// reported once per distinct error so a broken edit is visible without
+// spamming the log every interval. On success the change is logged and the new
+// configuration becomes active. Values that cannot be changed at runtime
+// (listen address, log/audit destinations) are applied on the next restart.
+func watchConfig(ctx context.Context, path string, initial *config.Config, p *portal.Portal) {
+	ticker := time.NewTicker(configReloadInterval)
+	defer ticker.Stop()
+
+	active := initial
+	lastErr := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next, err := config.Load(path)
+			if err != nil {
+				if msg := err.Error(); msg != lastErr {
+					slog.Warn("configuration reload skipped: file is invalid", "path", path, "error", err)
+					lastErr = msg
+				}
+				continue
+			}
+			lastErr = ""
+			if reflect.DeepEqual(active, next) {
+				continue
+			}
+			if err := p.Reload(next); err != nil {
+				slog.Error("configuration reload failed; keeping the previous configuration",
+					"path", path, "error", err)
+				continue
+			}
+			slog.Info("configuration reloaded", "path", path)
+			active = next
+		}
+	}
 }
 
 // newLogger builds the process logger. When file logging is configured it

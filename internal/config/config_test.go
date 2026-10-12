@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeConfig writes a YAML file into a temp dir and returns its path.
@@ -136,6 +137,110 @@ func TestAllowedKeyTypes(t *testing.T) {
 	c.Yubico.KeyTypes = []string{"eccp256", "rsa3072"}
 	if got := c.AllowedKeyTypes(); len(got) != 2 || got[0] != "eccp256" {
 		t.Errorf("key_types override = %v, want [eccp256 rsa3072]", got)
+	}
+}
+
+func TestSessionTimeoutDefaults(t *testing.T) {
+	var c Config
+	if got := c.SessionMaxAge(); got != time.Hour {
+		t.Errorf("default SessionMaxAge = %v, want 1h", got)
+	}
+	if got := c.SessionIdleTimeout(); got != 30*time.Minute {
+		t.Errorf("default SessionIdleTimeout = %v, want 30m", got)
+	}
+
+	c.Server.SessionMaxAge = "8h"
+	c.Server.SessionIdleTimeout = "45m"
+	if got := c.SessionMaxAge(); got != 8*time.Hour {
+		t.Errorf("SessionMaxAge = %v, want 8h", got)
+	}
+	if got := c.SessionIdleTimeout(); got != 45*time.Minute {
+		t.Errorf("SessionIdleTimeout = %v, want 45m", got)
+	}
+}
+
+func TestValidateSessionTimeouts(t *testing.T) {
+	c := validConfig(t)
+	c.Server.SessionMaxAge = "not-a-duration"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "session_max_age") {
+		t.Errorf("expected session_max_age error, got %v", err)
+	}
+
+	c = validConfig(t)
+	c.Server.SessionIdleTimeout = "0s"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "session_idle_timeout") {
+		t.Errorf("expected positive-duration error, got %v", err)
+	}
+
+	c = validConfig(t)
+	c.Server.SessionMaxAge = "30m"
+	c.Server.SessionIdleTimeout = "1h"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "must not exceed") {
+		t.Errorf("expected idle>max error, got %v", err)
+	}
+
+	c = validConfig(t)
+	c.Server.SessionMaxAge = "8h"
+	c.Server.SessionIdleTimeout = "30m"
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid session timeouts rejected: %v", err)
+	}
+}
+
+func TestValidateMinFirmwareAndSerial(t *testing.T) {
+	c := validConfig(t)
+	c.Yubico.MinFirmware = "5.4"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "min_firmware") {
+		t.Errorf("expected min_firmware error, got %v", err)
+	}
+
+	c = validConfig(t)
+	c.Yubico.MinSerial = "-1"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "min_serial") {
+		t.Errorf("expected min_serial error, got %v", err)
+	}
+
+	c = validConfig(t)
+	c.Yubico.MinFirmware = "5.4.3"
+	c.Yubico.MinSerial = "1000000"
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid minimums rejected: %v", err)
+	}
+}
+
+func TestValidateDeviceFingerprints(t *testing.T) {
+	c := validConfig(t)
+	c.Yubico.DeviceFingerprints = map[string][]string{"chris": {"not-a-fingerprint"}}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "device_fingerprints") {
+		t.Errorf("expected device_fingerprints error, got %v", err)
+	}
+
+	c = validConfig(t)
+	valid := "sha256:" + strings.Repeat("a", 64)
+	c.Yubico.DeviceFingerprints = map[string][]string{"chris": {valid}}
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid fingerprint rejected: %v", err)
+	}
+}
+
+func TestApplyDefaultsNormalizesDeviceFingerprints(t *testing.T) {
+	var c Config
+	valid := "sha256:" + strings.Repeat("a", 64)
+	c.Yubico.DeviceFingerprints = map[string][]string{
+		"  CHRIS  ": {"  " + valid + "  ", ""},
+		"":          {valid},
+		"dave":      {""},
+	}
+	c.applyDefaults()
+
+	if got := c.DeviceFingerprints()["chris"]; len(got) != 1 || got[0] != valid {
+		t.Errorf("chris fingerprints = %v, want [%s]", got, valid)
+	}
+	if _, ok := c.DeviceFingerprints()[""]; ok {
+		t.Error("empty CN keys must be dropped")
+	}
+	if _, ok := c.DeviceFingerprints()["dave"]; ok {
+		t.Error("CNs whose fingerprints all normalize to empty must be dropped")
 	}
 }
 

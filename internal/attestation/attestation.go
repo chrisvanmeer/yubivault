@@ -7,14 +7,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -44,6 +47,14 @@ type Options struct {
 	// StrictSlotCheck requires the attestation subject to name the selected
 	// PIV slot.
 	StrictSlotCheck bool
+	// MinFirmware rejects YubiKeys whose attestation reports a firmware
+	// version below the given major.minor.patch. Attestations without a
+	// firmware version are rejected as well (fail-closed).
+	MinFirmware string
+	// MinSerial rejects YubiKeys whose attestation serial number is below the
+	// given value. Attestations without a serial number are rejected as well
+	// (fail-closed).
+	MinSerial string
 }
 
 // Verifier validates YubiKey PIV attestation chains.
@@ -51,6 +62,8 @@ type Verifier struct {
 	roots           *x509.CertPool
 	allowedKeyTypes map[string]bool
 	strictSlotCheck bool
+	minVersion      *version
+	minSerial       *big.Int
 }
 
 // Result is the outcome of a successful attestation verification.
@@ -63,6 +76,10 @@ type Result struct {
 	Serial string
 	// Firmware is the YubiKey firmware version (major.minor.patch), or "".
 	Firmware string
+	// Fingerprint is a stable device identifier derived from the attestation
+	// certificate public key ("sha256:" + 64 hex). It is always present after
+	// a successful verification.
+	Fingerprint string
 }
 
 // New builds a Verifier from the given options.
@@ -77,11 +94,58 @@ func New(opts Options) (*Verifier, error) {
 	if len(allowed) == 0 {
 		return nil, errors.New("at least one allowed key type is required")
 	}
-	return &Verifier{
+	v := &Verifier{
 		roots:           opts.Roots,
 		allowedKeyTypes: allowed,
 		strictSlotCheck: opts.StrictSlotCheck,
-	}, nil
+	}
+	if opts.MinFirmware != "" {
+		mv, ok := parseVersion(opts.MinFirmware)
+		if !ok {
+			return nil, fmt.Errorf("min firmware must be a firmware version such as '5.4.3' (got '%s')", opts.MinFirmware)
+		}
+		v.minVersion = &mv
+	}
+	if opts.MinSerial != "" {
+		n, ok := new(big.Int).SetString(opts.MinSerial, 10)
+		if !ok || n.Sign() < 0 {
+			return nil, fmt.Errorf("min serial must be a non-negative integer (got '%s')", opts.MinSerial)
+		}
+		v.minSerial = n
+	}
+	return v, nil
+}
+
+// version is a packed major.minor.patch firmware version.
+type version [3]byte
+
+func parseVersion(s string) (version, bool) {
+	var v version
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return v, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 || n > 255 {
+			return v, false
+		}
+		v[i] = byte(n)
+	}
+	return v, true
+}
+
+func (v version) less(o version) bool {
+	for i := 0; i < 3; i++ {
+		if v[i] != o[i] {
+			return v[i] < o[i]
+		}
+	}
+	return false
+}
+
+func (v version) String() string {
+	return fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
 }
 
 // LoadRoots builds a certificate pool that ONLY contains the operator
@@ -244,12 +308,42 @@ func (v *Verifier) Verify(csrPEM, attestPEM, intPEM []byte, expectedCN, selected
 	}
 
 	serial, firmware := DeviceInfo(attestCert)
+	if err := v.enforceDevicePolicy(serial, firmware); err != nil {
+		return nil, err
+	}
+
 	return &Result{
 		CSR:         csr,
 		Attestation: attestCert,
 		Serial:      serial,
 		Firmware:    firmware,
+		Fingerprint: FingerprintOf(attestCert.PublicKey),
 	}, nil
+}
+
+// enforceDevicePolicy applies the optional minimum firmware and serial
+// constraints, fail-closed: when a minimum is configured and the attestation
+// cannot prove compliance, the device is rejected.
+func (v *Verifier) enforceDevicePolicy(serial, firmware string) error {
+	if v.minVersion != nil {
+		fw, ok := parseVersion(firmware)
+		if !ok {
+			return fmt.Errorf("attestation lacks a usable firmware version; the configured minimum is %s", v.minVersion)
+		}
+		if fw.less(*v.minVersion) {
+			return fmt.Errorf("YubiKey firmware %s is below the required minimum %s", fw, v.minVersion)
+		}
+	}
+	if v.minSerial != nil {
+		n, ok := new(big.Int).SetString(serial, 10)
+		if !ok {
+			return fmt.Errorf("attestation lacks a usable serial number; the configured minimum is %s", v.minSerial)
+		}
+		if n.Cmp(v.minSerial) < 0 {
+			return fmt.Errorf("YubiKey serial %s is below the required minimum %s", n, v.minSerial)
+		}
+	}
+	return nil
 }
 
 // verifySlot ensures the attestation statement was created for the PIV slot
@@ -316,6 +410,18 @@ func parseFirmware(value []byte) string {
 		return ""
 	}
 	return fmt.Sprintf("%d.%d.%d", raw[0], raw[1], raw[2])
+}
+
+// FingerprintOf derives a stable device identifier from a public key: the
+// SHA-256 of the PKIX DER encoding, formatted as "sha256:" + hex. It uniquely
+// identifies the cryptographic identity inside a given YubiKey PIV slot.
+func FingerprintOf(pub any) string {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(der)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // PublicKeyType maps a public key to a configured key type name.

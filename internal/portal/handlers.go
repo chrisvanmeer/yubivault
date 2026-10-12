@@ -31,16 +31,17 @@ import (
 // issuedCert holds the properties of a freshly signed certificate shown in
 // the success modal.
 type issuedCert struct {
-	CertPEM         string
-	Serial          string
-	CN              string
-	Slot            string
-	KeyType         string
-	NotAfter        string
-	Issued          int
-	Warnings        []string
-	YubiKeySerial   string
-	YubiKeyFirmware string
+	CertPEM            string
+	Serial             string
+	CN                 string
+	Slot               string
+	KeyType            string
+	NotAfter           string
+	Issued             int
+	Warnings           []string
+	YubiKeySerial      string
+	YubiKeyFirmware    string
+	YubiKeyFingerprint string
 }
 
 // ---------------------------------------------------------------------------
@@ -53,9 +54,20 @@ func (p *Portal) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	authenticated, fresh := p.sessionState(r)
+	if authenticated && !fresh {
+		// The login outlived the absolute or idle limit: clear it and send the
+		// visitor back to the login page with an explanation.
+		p.invalidateSession(w, r)
+		http.Redirect(w, r, "/?error=session_expired", http.StatusSeeOther)
+		return
+	}
+
 	// Refresh the session cookie so an active visitor's login slides forward.
-	if _, err := p.loadSession(w, r); err != nil {
-		p.logger.Debug("session refresh failed", "error", err)
+	if authenticated {
+		if _, err := p.loadSession(w, r); err != nil {
+			p.logger.Debug("session refresh failed", "error", err)
+		}
 	}
 
 	identity, token := p.sessionIdentity(r)
@@ -69,15 +81,15 @@ func (p *Portal) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"LoginError":          loginErrorMessage(r),
 		"UserIdentity":        identity,
 		"CertCN":              cn,
-		"CNEditable":          p.config.AllowCNOverride(),
-		"CNPattern":           p.config.CNPattern(),
-		"KeyTypes":            keyTypeChoices(p.config),
-		"UITitle":             p.config.UI.Title,
-		"UIShortTitle":        p.config.UI.ShortTitle,
-		"RevokeExisting":      p.config.Vault.RevokeExisting,
-		"SingleKeyType":       len(p.config.AllowedKeyTypes()) == 1,
-		"HasAppRole":          p.config.Vault.AppRoleRoleID != "" && p.config.Vault.AppRoleSecretID != "",
-		"CertificatesEnabled": p.config.CertificatesEnabled(),
+		"CNEditable":          p.config().AllowCNOverride(),
+		"CNPattern":           p.config().CNPattern(),
+		"KeyTypes":            keyTypeChoices(p.config()),
+		"UITitle":             p.config().UI.Title,
+		"UIShortTitle":        p.config().UI.ShortTitle,
+		"RevokeExisting":      p.config().Vault.RevokeExisting,
+		"SingleKeyType":       len(p.config().AllowedKeyTypes()) == 1,
+		"HasAppRole":          p.config().Vault.AppRoleRoleID != "" && p.config().Vault.AppRoleSecretID != "",
+		"CertificatesEnabled": p.config().CertificatesEnabled(),
 	}
 	p.addManualData(data, r)
 	p.renderTemplate(w, "index.html", data)
@@ -94,12 +106,12 @@ func (p *Portal) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{"vault": "ok"}
 	ready := true
 
-	if err := p.pki.Healthy(); err != nil {
+	if err := p.pki().Healthy(); err != nil {
 		checks["vault"] = err.Error()
 		ready = false
 	}
-	if p.config.Vault.RevokeExisting {
-		if err := p.pki.CheckAppRole(); err != nil {
+	if p.config().Vault.RevokeExisting {
+		if err := p.pki().CheckAppRole(); err != nil {
 			checks["approle"] = err.Error()
 			ready = false
 		} else {
@@ -134,7 +146,7 @@ func (p *Portal) checkOIDC(ctx context.Context) error {
 	p.oidcCheckAt = time.Now()
 	ctx, cancel := context.WithTimeout(ctx, oidcTimeout)
 	defer cancel()
-	prov, err := oidc.NewProvider(ctx, p.config.OIDC.Issuer)
+	prov, err := oidc.NewProvider(ctx, p.config().OIDC.Issuer)
 	if err != nil {
 		p.oidcCheckErr = err
 		return err
@@ -148,19 +160,19 @@ func (p *Portal) handleLogin(w http.ResponseWriter, r *http.Request) {
 	state := newOAuthState()
 	nonce := newOAuthState()
 
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err != nil {
 		renderError(w, http.StatusInternalServerError, "Unable to create a session. Please retry.")
 		return
 	}
-	session.Values["oauth_state"] = state
-	session.Values["oauth_nonce"] = nonce
+	session.Values[sessionStateKey] = state
+	session.Values[sessionNonceKey] = nonce
 	if err := session.Save(r, w); err != nil {
 		renderError(w, http.StatusInternalServerError, "Unable to persist the session. Please retry.")
 		return
 	}
 
-	authURL := p.oauth2Config.AuthCodeURL(state, oidc.Nonce(nonce))
+	authURL := p.oauth2Config().AuthCodeURL(state, oidc.Nonce(nonce))
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
@@ -172,19 +184,19 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err != nil {
 		renderError(w, http.StatusBadRequest, "Session not found. Please log in again.")
 		return
 	}
 
-	savedState, _ := session.Values["oauth_state"].(string)
+	savedState, _ := session.Values[sessionStateKey].(string)
 	if savedState == "" || savedState != r.URL.Query().Get("state") {
 		renderError(w, http.StatusBadRequest, "Invalid OAuth state token.")
 		return
 	}
 
-	oauth2Token, err := p.oauth2Config.Exchange(r.Context(), r.URL.Query().Get("code"))
+	oauth2Token, err := p.oauth2Config().Exchange(r.Context(), r.URL.Query().Get("code"))
 	if err != nil {
 		p.logger.Error("OAuth token exchange failed", "error", err)
 		renderError(w, http.StatusBadGateway, "OAuth token exchange failed.")
@@ -197,8 +209,8 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	savedNonce, _ := session.Values["oauth_nonce"].(string)
-	idToken, err := p.oidcVerifier.Verify(r.Context(), rawIDToken)
+	savedNonce, _ := session.Values[sessionNonceKey].(string)
+	idToken, err := p.oidcVerifier().Verify(r.Context(), rawIDToken)
 	if err != nil {
 		p.logger.Error("ID token verification failed", "error", err)
 		renderError(w, http.StatusBadGateway, "ID token verification failed.")
@@ -218,15 +230,15 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if identity == "" {
 		identity = email
 	}
-	groups := parseGroups(claimPath(claims, p.config.GroupsClaim()))
+	groups := parseGroups(claimPath(claims, p.config().GroupsClaim()))
 
-	if allowed := p.config.AllowedGroups(); len(allowed) > 0 && !memberOfAny(groups, allowed) {
+	if allowed := p.config().AllowedGroups(); len(allowed) > 0 && !memberOfAny(groups, allowed) {
 		p.logger.Warn("rejected login: not a member of an allowed group",
 			"identity", identity, "groups", groups)
 		p.audit.Log(audit.Event{Event: audit.EventLoginDenied, Outcome: audit.OutcomeDenied,
 			Reason: "not a member of an allowed group", Identity: identity, RemoteIP: clientIP(r)})
-		delete(session.Values, "oauth_state")
-		delete(session.Values, "oauth_nonce")
+		delete(session.Values, sessionStateKey)
+		delete(session.Values, sessionNonceKey)
 		_ = session.Save(r, w)
 		http.Redirect(w, r, "/?error=access_denied", http.StatusSeeOther)
 		return
@@ -250,12 +262,17 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session.Values["user_identity"] = identity
-	session.Values["user_email"] = email
-	session.Values["user_groups"] = groups
-	session.Values["raw_id_token"] = rawIDToken
-	delete(session.Values, "oauth_state")
-	delete(session.Values, "oauth_nonce")
+	// Stamp the login and activity timestamps. They bound the session's
+	// absolute lifetime and its idle window respectively.
+	now := time.Now().UTC().Format(time.RFC3339)
+	session.Values[sessionLoginKey] = now
+	session.Values[sessionActiveKey] = now
+	session.Values[sessionIdentityK] = identity
+	session.Values[sessionEmailKey] = email
+	session.Values[sessionGroupsKey] = groups
+	session.Values[sessionTokenKey] = rawIDToken
+	delete(session.Values, sessionStateKey)
+	delete(session.Values, sessionNonceKey)
 	if err := session.Save(r, w); err != nil {
 		renderError(w, http.StatusInternalServerError, "Unable to persist the session.")
 		return
@@ -268,26 +285,23 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Portal) handleLogout(w http.ResponseWriter, r *http.Request) {
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err == nil {
-		rawIDToken, _ := session.Values["raw_id_token"].(string)
-		identity, _ := session.Values["user_identity"].(string)
-		delete(session.Values, "user_identity")
-		delete(session.Values, "user_groups")
-		delete(session.Values, "raw_id_token")
-		delete(session.Values, "oauth_state")
-		delete(session.Values, "oauth_nonce")
-		session.Options.MaxAge = -1
-		_ = session.Save(r, w)
+		rawIDToken, _ := session.Values[sessionTokenKey].(string)
+		identity, _ := session.Values[sessionIdentityK].(string)
+
+		// invalidateSession clears the values and expires the cookie using a
+		// cloned Options, so the shared store defaults are not poisoned.
+		p.invalidateSession(w, r)
 		p.audit.Log(audit.Event{Event: audit.EventLogout, Outcome: audit.OutcomeSuccess,
 			Identity: identity, RemoteIP: clientIP(r)})
 
 		// RP-initiated logout at the identity provider when configured.
-		if p.endSessionURL != "" && p.config.OIDC.LogoutRedirectURI != "" {
-			target := p.endSessionURL
+		if p.endSessionURL() != "" && p.config().OIDC.LogoutRedirectURI != "" {
+			target := p.endSessionURL()
 			target = addQuery(target, "id_token_hint", rawIDToken)
-			target = addQuery(target, "post_logout_redirect_uri", p.config.OIDC.LogoutRedirectURI)
-			target = addQuery(target, "client_id", p.config.OIDC.ClientID)
+			target = addQuery(target, "post_logout_redirect_uri", p.config().OIDC.LogoutRedirectURI)
+			target = addQuery(target, "client_id", p.config().OIDC.ClientID)
 			http.Redirect(w, r, target, http.StatusFound)
 			return
 		}
@@ -300,40 +314,58 @@ func (p *Portal) handleLogout(w http.ResponseWriter, r *http.Request) {
 // Certificate issuance
 // ---------------------------------------------------------------------------
 
-func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
+// signRequest is the parsed and validated input of a signing request. The
+// uploaded files are kept verbatim so the request stays stateless: after a
+// preview the browser re-submits the same form to /api/sign-csr.
+type signRequest struct {
+	Identity     string
+	RawIDToken   string
+	CN           string
+	Slot         string
+	KeyType      string
+	CSR          []byte
+	Attest       []byte
+	Intermediate []byte
+}
+
+// parseSignRequest validates the multipart signing form and reads the uploaded
+// files. On any validation error it renders the error fragment and reports
+// false so the caller can return immediately.
+func (p *Portal) parseSignRequest(w http.ResponseWriter, r *http.Request) (*signRequest, bool) {
 	if r.Method != http.MethodPost {
 		renderError(w, http.StatusMethodNotAllowed, "Method not allowed.")
-		return
+		return nil, false
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
 		renderError(w, http.StatusRequestEntityTooLarge, "Upload exceeds the 2MB payload limit.")
-		return
+		return nil, false
 	}
 
 	identity, rawIDToken := p.sessionIdentity(r)
 	if identity == "" || rawIDToken == "" {
 		renderError(w, http.StatusUnauthorized, "Your session has expired. Please log in again.")
-		return
+		return nil, false
 	}
+
 	cn, err := p.certCN(identity, p.sessionEmail(r))
 	if err != nil {
 		renderError(w, http.StatusForbidden,
 			"Your account name cannot be used as a certificate Common Name.")
-		return
+		return nil, false
 	}
-	if p.config.AllowCNOverride() {
+	if p.config().AllowCNOverride() {
 		if override := strings.ToLower(strings.TrimSpace(r.FormValue("cn"))); override != "" && override != cn {
 			if err := attestation.ValidateCN(override); err != nil {
 				renderError(w, http.StatusBadRequest,
 					"The Common Name you entered contains unsupported characters.")
-				return
+				return nil, false
 			}
-			if err := p.config.ValidateCNPattern(override); err != nil {
+			if err := p.config().ValidateCNPattern(override); err != nil {
 				renderError(w, http.StatusBadRequest,
 					"The Common Name you entered does not match the required format.")
-				return
+				return nil, false
 			}
 			cn = override
 		}
@@ -342,60 +374,127 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	selectedSlot := r.FormValue("slot")
 	if selectedSlot != "9a" && selectedSlot != "9c" {
 		renderError(w, http.StatusBadRequest, "Invalid PIV slot selected.")
-		return
+		return nil, false
 	}
 
 	selectedKeyType := r.FormValue("key_type")
 	if selectedKeyType == "" {
 		renderError(w, http.StatusBadRequest, "No key type selected.")
-		return
+		return nil, false
 	}
-	if !isAllowedKeyType(p.config, selectedKeyType) {
+	if !isAllowedKeyType(p.config(), selectedKeyType) {
 		renderError(w, http.StatusBadRequest, fmt.Sprintf("Key type '%s' is not enabled.", selectedKeyType))
-		return
+		return nil, false
 	}
 
 	csrPEM, err := readFileFromForm(r, "csr")
 	if err != nil {
 		renderError(w, http.StatusBadRequest, "Failed to read the CSR file.")
-		return
+		return nil, false
 	}
 	attestPEM, err := readFileFromForm(r, "attest")
 	if err != nil {
 		renderError(w, http.StatusBadRequest, "Failed to read the attestation certificate file.")
-		return
+		return nil, false
 	}
 	intPEM, err := readFileFromForm(r, "intermediate")
 	if err != nil {
 		renderError(w, http.StatusBadRequest, "Failed to read the intermediate certificate file.")
+		return nil, false
+	}
+
+	return &signRequest{
+		Identity:     identity,
+		RawIDToken:   rawIDToken,
+		CN:           cn,
+		Slot:         selectedSlot,
+		KeyType:      selectedKeyType,
+		CSR:          csrPEM,
+		Attest:       attestPEM,
+		Intermediate: intPEM,
+	}, true
+}
+
+// verifyAttestation verifies the attestation chain and the optional per-CN
+// device fingerprint pinning for a parsed request. On failure it writes a
+// denied audit event and renders the error fragment.
+func (p *Portal) verifyAttestation(w http.ResponseWriter, r *http.Request, req *signRequest) (*attestation.Result, bool) {
+	result, err := p.attest().Verify(req.CSR, req.Attest, req.Intermediate, req.CN, req.Slot, req.KeyType)
+	if err != nil {
+		p.logIssueDenied(r, req, err)
+		renderError(w, http.StatusBadRequest, fmt.Sprintf("Attestation verification failed: %v", err))
+		return nil, false
+	}
+	if err := p.pinnedDeviceErr(req.CN, result.Fingerprint); err != nil {
+		p.logIssueDenied(r, req, err, result.Fingerprint)
+		renderError(w, http.StatusBadRequest,
+			"This YubiKey is not the one registered for your account. Contact your administrator.")
+		return nil, false
+	}
+	return result, true
+}
+
+// logIssueDenied writes a structured log line and a denied audit event for a
+// rejected issuance attempt. The attested fingerprint is included when known.
+func (p *Portal) logIssueDenied(r *http.Request, req *signRequest, reason error, fingerprint ...string) {
+	p.logger.Warn("attestation rejected",
+		"identity", req.Identity, "slot", req.Slot, "key_type", req.KeyType, "error", reason)
+	event := audit.Event{
+		Event:    audit.EventIssueDenied,
+		Outcome:  audit.OutcomeDenied,
+		Reason:   reason.Error(),
+		Identity: req.Identity,
+		CN:       req.CN,
+		Slot:     req.Slot,
+		KeyType:  req.KeyType,
+		RemoteIP: clientIP(r),
+	}
+	if len(fingerprint) > 0 {
+		event.YubiKeyFingerprint = fingerprint[0]
+	}
+	p.audit.Log(event)
+}
+
+// pinnedDeviceErr enforces the optional per-Common-Name device fingerprint
+// allowlist. A CN without an entry is not pinned: any attested YubiKey is
+// accepted. A CN with entries only accepts a fingerprint from its list. The
+// fingerprint is always recorded in the audit trail either way.
+func (p *Portal) pinnedDeviceErr(cn, fingerprint string) error {
+	allowed := p.config().DeviceFingerprints()[cn]
+	if len(allowed) == 0 {
+		return nil
+	}
+	for _, fp := range allowed {
+		if strings.EqualFold(fp, fingerprint) {
+			return nil
+		}
+	}
+	return fmt.Errorf("attested device %s is not pinned to CN %q", fingerprint, cn)
+}
+
+func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
+	req, ok := p.parseSignRequest(w, r)
+	if !ok {
 		return
 	}
 
-	result, err := p.attest.Verify(csrPEM, attestPEM, intPEM, cn, selectedSlot, selectedKeyType)
-	if err != nil {
-		p.logger.Warn("attestation rejected",
-			"identity", identity, "slot", selectedSlot, "key_type", selectedKeyType, "error", err)
-		p.audit.Log(audit.Event{
-			Event:    audit.EventIssueDenied,
-			Outcome:  audit.OutcomeDenied,
-			Reason:   err.Error(),
-			Identity: identity,
-			CN:       cn,
-			Slot:     selectedSlot,
-			KeyType:  selectedKeyType,
-			RemoteIP: clientIP(r),
-		})
-		renderError(w, http.StatusBadRequest, fmt.Sprintf("Attestation verification failed: %v", err))
+	result, ok := p.verifyAttestation(w, r, req)
+	if !ok {
 		return
 	}
+
+	identity := req.Identity
+	cn := req.CN
+	selectedSlot := req.Slot
+	selectedKeyType := req.KeyType
 
 	// Determine whether the user already has a revocable certificate. The
 	// confirmation warning is only rendered when one actually exists.
 	var pendingRevocations []pki.ActiveCert
-	if p.config.Vault.RevokeExisting {
-		active, err := p.pki.FindActiveCertificates(cn)
+	if p.config().Vault.RevokeExisting {
+		active, err := p.pki().FindActiveCertificates(cn)
 		switch {
-		case err != nil && p.pki.StrictRevocation():
+		case err != nil && p.pki().StrictRevocation():
 			p.logger.Error("could not determine existing certificates", "identity", identity, "error", err)
 			renderError(w, http.StatusBadGateway,
 				"Unable to verify whether you already have an active certificate. Please try again later.")
@@ -415,7 +514,7 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	certPEM, serial, err := p.pki.IssueCertificate(cn, string(csrPEM), rawIDToken)
+	certPEM, serial, err := p.pki().IssueCertificate(cn, string(req.CSR), req.RawIDToken)
 	if err != nil {
 		p.logger.Error("certificate signing failed", "identity", identity, "error", err)
 		renderError(w, http.StatusBadGateway,
@@ -424,14 +523,15 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issued := issuedCert{
-		CertPEM:         certPEM,
-		Serial:          serial,
-		CN:              result.CSR.Subject.CommonName,
-		Slot:            selectedSlot,
-		KeyType:         selectedKeyType,
-		Issued:          len(pendingRevocations),
-		YubiKeySerial:   result.Serial,
-		YubiKeyFirmware: result.Firmware,
+		CertPEM:            certPEM,
+		Serial:             serial,
+		CN:                 result.CSR.Subject.CommonName,
+		Slot:               selectedSlot,
+		KeyType:            selectedKeyType,
+		Issued:             len(pendingRevocations),
+		YubiKeySerial:      result.Serial,
+		YubiKeyFirmware:    result.Firmware,
+		YubiKeyFingerprint: result.Fingerprint,
 	}
 	if parsed, err := pki.ParseCertificate(certPEM); err == nil {
 		issued.NotAfter = parsed.NotAfter.UTC().Format("2006-01-02 15:04 UTC")
@@ -452,7 +552,7 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 			}
 			toRevoke = append(toRevoke, c.Serial)
 		}
-		if err := p.pki.RevokeCertificates(toRevoke); err != nil {
+		if err := p.pki().RevokeCertificates(toRevoke); err != nil {
 			p.logger.Error("revocation after issuance failed",
 				"identity", identity, "serials", toRevoke, "error", err)
 			issued.Warnings = append(issued.Warnings,
@@ -471,19 +571,60 @@ func (p *Portal) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.audit.Log(audit.Event{
-		Event:           audit.EventIssue,
-		Outcome:         audit.OutcomeSuccess,
-		Identity:        identity,
-		CN:              cn,
-		Serial:          serial,
-		Slot:            selectedSlot,
-		KeyType:         selectedKeyType,
-		YubiKeySerial:   result.Serial,
-		YubiKeyFirmware: result.Firmware,
-		RemoteIP:        clientIP(r),
+		Event:              audit.EventIssue,
+		Outcome:            audit.OutcomeSuccess,
+		Identity:           identity,
+		CN:                 cn,
+		Serial:             serial,
+		Slot:               selectedSlot,
+		KeyType:            selectedKeyType,
+		YubiKeySerial:      result.Serial,
+		YubiKeyFirmware:    result.Firmware,
+		YubiKeyFingerprint: result.Fingerprint,
+		RemoteIP:           clientIP(r),
 	})
 
 	p.renderTemplate(w, "cert_modal.html", issued)
+}
+
+// attestPreview is the data rendered by the preview wizard step.
+type attestPreview struct {
+	CN              string
+	Identity        string
+	Slot            string
+	KeyType         string
+	YubiKeySerial   string
+	YubiKeyFirmware string
+	Fingerprint     string
+	Pinned          bool
+	RevokeExisting  bool
+}
+
+// handlePreviewAttest verifies the attestation and the device policy without
+// issuing anything, letting the user confirm the YubiKey identity (serial,
+// firmware and fingerprint) before the certificate is created. The uploads
+// stay in the form, so the final /api/sign-csr step re-verifies them
+// statelessly.
+func (p *Portal) handlePreviewAttest(w http.ResponseWriter, r *http.Request) {
+	req, ok := p.parseSignRequest(w, r)
+	if !ok {
+		return
+	}
+	result, ok := p.verifyAttestation(w, r, req)
+	if !ok {
+		return
+	}
+	p.renderTemplate(w, "preview.html", attestPreview{
+		CN:              req.CN,
+		Identity:        req.Identity,
+		Slot:            req.Slot,
+		KeyType:         req.KeyType,
+		YubiKeySerial:   result.Serial,
+		YubiKeyFirmware: result.Firmware,
+		Fingerprint:     result.Fingerprint,
+		Pinned:          len(p.config().DeviceFingerprints()[req.CN]) > 0,
+		RevokeExisting:  p.config().Vault.RevokeExisting,
+	})
 }
 
 // handleActiveCert reports whether the authenticated user currently holds an
@@ -501,7 +642,7 @@ func (p *Portal) handleActiveCert(w http.ResponseWriter, r *http.Request) {
 			"Your account name cannot be used as a certificate Common Name.")
 		return
 	}
-	active, err := p.pki.FindActiveCertificates(cn)
+	active, err := p.pki().FindActiveCertificates(cn)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err != nil {
 		p.logger.Warn("active certificate lookup failed", "identity", identity, "error", err)
@@ -522,6 +663,12 @@ func (p *Portal) handleInventory(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// The route is always registered so a hot-reloaded ui.certificates_enabled
+	// flip takes effect immediately; gate access on the live config here.
+	if !p.config().CertificatesEnabled() {
+		http.NotFound(w, r)
+		return
+	}
 
 	identity, token := p.sessionIdentity(r)
 	isLoggedIn := identity != "" && token != ""
@@ -537,15 +684,15 @@ func (p *Portal) handleInventory(w http.ResponseWriter, r *http.Request) {
 		"IsLoggedIn":          true,
 		"UserIdentity":        identity,
 		"CertCN":              cn,
-		"UITitle":             p.config.UI.Title,
-		"UIShortTitle":        p.config.UI.ShortTitle,
-		"HasAppRole":          p.config.Vault.AppRoleRoleID != "" && p.config.Vault.AppRoleSecretID != "",
-		"CertificatesEnabled": p.config.CertificatesEnabled(),
+		"UITitle":             p.config().UI.Title,
+		"UIShortTitle":        p.config().UI.ShortTitle,
+		"HasAppRole":          p.config().Vault.AppRoleRoleID != "" && p.config().Vault.AppRoleSecretID != "",
+		"CertificatesEnabled": p.config().CertificatesEnabled(),
 	}
 	p.addManualData(data, r)
 
 	if hasAppRole, _ := data["HasAppRole"].(bool); hasAppRole {
-		certs, err := p.pki.ListCertificates()
+		certs, err := p.pki().ListCertificates()
 		if err != nil {
 			p.logger.Error("inventory listing failed", "identity", identity, "error", err)
 			data["LoadError"] = err.Error()
@@ -771,7 +918,7 @@ func (p *Portal) loadManualDoc(key, file string) (manualDoc, bool) {
 // loadManuals prepares every configured manual and picks a default tab for the
 // visitor based on the request's User-Agent.
 func (p *Portal) loadManuals(r *http.Request) manualData {
-	paths := p.config.ManualFiles()
+	paths := p.config().ManualFiles()
 	if len(paths) == 0 {
 		return manualData{}
 	}
@@ -816,7 +963,7 @@ func (p *Portal) handleManualRaw(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusMethodNotAllowed, "Method not allowed.")
 		return
 	}
-	path := p.config.ManualPath(r.URL.Query().Get("os"))
+	path := p.config().ManualPath(r.URL.Query().Get("os"))
 	if path == "" {
 		http.NotFound(w, r)
 		return
@@ -849,7 +996,7 @@ func (p *Portal) handleManualAsset(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusMethodNotAllowed, "Method not allowed.")
 		return
 	}
-	base := filepath.Clean(p.config.ManualDir())
+	base := filepath.Clean(p.config().ManualDir())
 	if base == "" || base == "." {
 		http.NotFound(w, r)
 		return
@@ -931,7 +1078,7 @@ func parseGroups(v any) []string {
 
 // sessionGroups returns the OIDC group memberships stored in the session.
 func (p *Portal) sessionGroups(r *http.Request) (bool, []string) {
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err != nil {
 		return false, nil
 	}
@@ -943,7 +1090,7 @@ func (p *Portal) sessionGroups(r *http.Request) (bool, []string) {
 // configured allowed groups. When no groups are configured, everyone is a
 // member (backward compatible).
 func (p *Portal) isMember(r *http.Request) bool {
-	allowed := p.config.AllowedGroups()
+	allowed := p.config().AllowedGroups()
 	if len(allowed) == 0 {
 		return true
 	}

@@ -249,6 +249,43 @@
             htmx.trigger(form, 'submit');
         }
 
+        // Step 1 of the issuance wizard: verify the attestation and show the
+        // YubiKey identity (serial, firmware, fingerprint) before anything is
+        // signed. Nothing is issued here. The uploads stay in the form, so the
+        // preview fragment's "Verify & Issue" button (submitCSR) can re-submit
+        // them to /api/sign-csr.
+        function verifyFiles() {
+            const form = document.getElementById('csr-sign-form');
+            if (!form.reportValidity()) return;
+            const cnInput = document.getElementById('cn-input');
+            const cnValue = cnInput ? cnInput.value.trim() : CERT_CN;
+            if (CN_EDITABLE && !cnIsValid(cnValue)) {
+                document.getElementById('response-area').innerHTML =
+                    '<div class="p-4 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">' +
+                    'The Common Name does not match the required format.</div>';
+                return;
+            }
+            syncCNField();
+            document.getElementById('confirm-revoke-input').value = 'false';
+            const spinner = document.getElementById('spinner');
+            const btn = document.getElementById('preview-btn');
+            if (spinner) spinner.classList.add('htmx-request');
+            if (btn) btn.disabled = true;
+            htmx.ajax('POST', '/api/preview-attest', {
+                source: form,
+                target: '#response-area',
+                swap: 'innerHTML'
+            }).finally(() => {
+                if (spinner) spinner.classList.remove('htmx-request');
+                if (btn) btn.disabled = false;
+            });
+        }
+
+        // Discards a preview result and returns to the empty form state.
+        function cancelPreview() {
+            document.getElementById('response-area').innerHTML = '';
+        }
+
         function confirmRevocationAndSubmit() {
             const form = document.getElementById('csr-sign-form');
             document.getElementById('confirm-revoke-input').value = 'true';
@@ -592,8 +629,8 @@ ykman piv certificates export f9 intermediate.crt</pre>
 
                             </div>
 
-                            <button id="submit-btn" type="button" onclick="submitCSR()" class="btn-primary mt-6">
-                                Verify &amp; Issue Certificate
+                            <button id="preview-btn" type="button" onclick="verifyFiles()" class="btn-primary mt-6">
+                                Verify &amp; Preview
                             </button>
                         </form>
 

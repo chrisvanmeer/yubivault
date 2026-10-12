@@ -1,6 +1,9 @@
 package attestation
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -159,5 +162,107 @@ func TestDeviceInfoMissingExtensions(t *testing.T) {
 	serial, firmware := DeviceInfo(cert)
 	if serial != "" || firmware != "" {
 		t.Errorf("expected empty device info, got %q / %q", serial, firmware)
+	}
+}
+
+func TestParseVersion(t *testing.T) {
+	valid := []struct {
+		in   string
+		want version
+	}{
+		{"5.4.3", version{5, 4, 3}},
+		{"2.4.4", version{2, 4, 4}},
+		{"0.0.0", version{0, 0, 0}},
+		{"255.255.255", version{255, 255, 255}},
+	}
+	for _, tc := range valid {
+		got, ok := parseVersion(tc.in)
+		if !ok || got != tc.want {
+			t.Errorf("parseVersion(%q) = (%v, %v), want (%v, true)", tc.in, got, ok, tc.want)
+		}
+	}
+	for _, in := range []string{"", "5.4", "5.4.3.1", "a.b.c", "256.0.0", "-1.0.0", "5.4.x"} {
+		if got, ok := parseVersion(in); ok {
+			t.Errorf("parseVersion(%q) = (%v, true), want failure", in, got)
+		}
+	}
+}
+
+func TestVersionLess(t *testing.T) {
+	cases := []struct {
+		a, b version
+		want bool
+	}{
+		{version{5, 4, 3}, version{5, 4, 4}, true},
+		{version{5, 4, 3}, version{5, 5, 0}, true},
+		{version{5, 4, 3}, version{6, 0, 0}, true},
+		{version{5, 4, 3}, version{5, 4, 3}, false},
+		{version{6, 0, 0}, version{5, 9, 9}, false},
+	}
+	for _, c := range cases {
+		if got := c.a.less(c.b); got != c.want {
+			t.Errorf("%v.less(%v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestEnforceDevicePolicy(t *testing.T) {
+	minFW := version{5, 4, 3}
+
+	withFW := &Verifier{minVersion: &minFW}
+	if err := withFW.enforceDevicePolicy("", "5.4.2"); err == nil {
+		t.Error("firmware below the minimum must be rejected")
+	}
+	if err := withFW.enforceDevicePolicy("", "5.4.3"); err != nil {
+		t.Errorf("firmware at the minimum should pass: %v", err)
+	}
+	if err := withFW.enforceDevicePolicy("", "5.5.0"); err != nil {
+		t.Errorf("firmware above the minimum should pass: %v", err)
+	}
+	if err := withFW.enforceDevicePolicy("", ""); err == nil {
+		t.Error("missing firmware must fail closed when a minimum is set")
+	}
+
+	withSerial := &Verifier{minSerial: big.NewInt(10000000)}
+	if err := withSerial.enforceDevicePolicy("9999999", ""); err == nil {
+		t.Error("serial below the minimum must be rejected")
+	}
+	if err := withSerial.enforceDevicePolicy("10000000", ""); err != nil {
+		t.Errorf("serial at the minimum should pass: %v", err)
+	}
+	if err := withSerial.enforceDevicePolicy("", ""); err == nil {
+		t.Error("missing serial must fail closed when a minimum is set")
+	}
+
+	noPolicy := &Verifier{}
+	if err := noPolicy.enforceDevicePolicy("", ""); err != nil {
+		t.Errorf("with no minimums any device should pass: %v", err)
+	}
+}
+
+func TestFingerprintOf(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	fp := FingerprintOf(&key.PublicKey)
+	if !strings.HasPrefix(fp, "sha256:") {
+		t.Errorf("fingerprint %q must start with sha256:", fp)
+	}
+	if len(fp) != len("sha256:")+64 {
+		t.Errorf("fingerprint %q has unexpected length %d", fp, len(fp))
+	}
+	if FingerprintOf(&key.PublicKey) != fp {
+		t.Error("fingerprint must be stable for the same key")
+	}
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate second key: %v", err)
+	}
+	if FingerprintOf(&other.PublicKey) == fp {
+		t.Error("different keys must produce different fingerprints")
+	}
+	if got := FingerprintOf("not a key"); got != "" {
+		t.Errorf("unencodable key should yield an empty fingerprint, got %q", got)
 	}
 }

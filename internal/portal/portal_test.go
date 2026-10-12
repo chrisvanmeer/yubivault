@@ -1,13 +1,21 @@
 package portal
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/sessions"
 
@@ -18,13 +26,25 @@ func testPortal() *Portal {
 	return &Portal{logger: slog.Default()}
 }
 
-func TestCertCN(t *testing.T) {
-	p := &Portal{
-		logger: slog.Default(),
-		config: &config.Config{},
+// testPortalWithConfig builds a Portal with a runtime snapshot for tests that
+// need configuration and session handling but not the attestation or Vault
+// wiring.
+func testPortalWithConfig(cfg *config.Config) *Portal {
+	if cfg == nil {
+		cfg = &config.Config{}
 	}
-	p.config.CN.Template = "{user}"
-	p.config.CN.Pattern = config.DefaultCNPattern
+	p := &Portal{logger: slog.Default()}
+	p.rt.Store(&portalRuntime{
+		config:      cfg,
+		cookieStore: sessions.NewCookieStore([]byte(strings.Repeat("h", 64)), []byte(strings.Repeat("b", 32))),
+	})
+	return p
+}
+
+func TestCertCN(t *testing.T) {
+	p := testPortalWithConfig(&config.Config{})
+	p.config().CN.Template = "{user}"
+	p.config().CN.Pattern = config.DefaultCNPattern
 
 	got, err := p.certCN("Chris@Example.com", "Chris@Example.com")
 	if err != nil {
@@ -34,8 +54,8 @@ func TestCertCN(t *testing.T) {
 		t.Errorf("certCN default = %q, want %q", got, "chris")
 	}
 
-	p.config.CN.Template = "{user}@{domain}"
-	p.config.CN.Domain = "example.com"
+	p.config().CN.Template = "{user}@{domain}"
+	p.config().CN.Domain = "example.com"
 	got, err = p.certCN("Chris", "Chris@Example.com")
 	if err != nil {
 		t.Fatalf("certCN dotted template returned error: %v", err)
@@ -44,7 +64,7 @@ func TestCertCN(t *testing.T) {
 		t.Errorf("certCN dotted = %q, want %q", got, "chris@example.com")
 	}
 
-	p.config.CN.Pattern = `[a-z.]+`
+	p.config().CN.Pattern = `[a-z.]+`
 	if _, err := p.certCN("Chris", "Chris@Example.com"); err == nil {
 		t.Error("certCN should reject a CN that does not match the pattern")
 	}
@@ -163,8 +183,8 @@ func TestLoadManuals(t *testing.T) {
 		t.Fatalf("failed to write pdf manual: %v", err)
 	}
 
-	p := &Portal{config: &config.Config{}, logger: slog.Default()}
-	p.config.UI.Manuals = map[string]string{"macos": macPath, "windows": winPath}
+	p := testPortalWithConfig(&config.Config{})
+	p.config().UI.Manuals = map[string]string{"macos": macPath, "windows": winPath}
 
 	reqFor := func(ua string) *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -196,20 +216,20 @@ func TestLoadManuals(t *testing.T) {
 		t.Errorf("selected = %q; want macos fallback for unknown OS", m.Selected)
 	}
 
-	p.config.UI.Manuals = nil
-	p.config.UI.ManualFile = macPath
+	p.config().UI.Manuals = nil
+	p.config().UI.ManualFile = macPath
 	if m := p.loadManuals(reqFor("curl/8.0")); !m.Available || m.Selected != "default" {
 		t.Errorf("fallback manual = %+v; want selected default", m)
 	}
 
-	p.config.UI.ManualFile = ""
+	p.config().UI.ManualFile = ""
 	if m := p.loadManuals(reqFor("curl/8.0")); m.Available {
 		t.Error("manual should be unavailable when nothing is configured")
 	}
 }
 
 func TestLoadManualRewritesImages(t *testing.T) {
-	p := &Portal{config: &config.Config{}, logger: slog.Default()}
+	p := testPortalWithConfig(&config.Config{})
 	dir := t.TempDir()
 	file := filepath.Join(dir, "manual.md")
 	body := "![step](images/step1.png)\n\n![remote](https://example.com/x.png)\n"
@@ -243,8 +263,8 @@ func TestHandleManualAsset(t *testing.T) {
 		t.Fatalf("failed to write secret: %v", err)
 	}
 
-	p := &Portal{config: &config.Config{}, logger: slog.Default()}
-	p.config.UI.ManualDir = dir
+	p := testPortalWithConfig(&config.Config{})
+	p.config().UI.ManualDir = dir
 
 	get := func(target string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -379,18 +399,14 @@ func equalStrings(a, b []string) bool {
 }
 
 func newSessionPortal() *Portal {
-	return &Portal{
-		config:      &config.Config{},
-		cookieStore: sessions.NewCookieStore([]byte(strings.Repeat("h", 64)), []byte(strings.Repeat("b", 32))),
-		logger:      slog.Default(),
-	}
+	return testPortalWithConfig(&config.Config{})
 }
 
 // seedSession writes session values into req and attaches the resulting cookie
 // so a subsequent session lookup in the same request sees them.
 func seedSession(t *testing.T, p *Portal, req *http.Request, values map[string]any) {
 	t.Helper()
-	sess, err := p.cookieStore.Get(req, sessionName)
+	sess, err := p.cookieStore().Get(req, sessionName)
 	if err != nil {
 		t.Fatalf("session lookup failed: %v", err)
 	}
@@ -412,7 +428,7 @@ func TestIsMember(t *testing.T) {
 		t.Error("empty allowlist should make everyone a member")
 	}
 
-	p.config.OIDC.AllowedGroups = []string{"yubivault-users"}
+	p.config().OIDC.AllowedGroups = []string{"yubivault-users"}
 
 	memberReq := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
 	seedSession(t, p, memberReq, map[string]any{"user_groups": []string{"Yubivault-Users"}})
@@ -434,7 +450,7 @@ func TestIsMember(t *testing.T) {
 
 func TestRequireMember(t *testing.T) {
 	p := newSessionPortal()
-	p.config.OIDC.AllowedGroups = []string{"yubivault-users"}
+	p.config().OIDC.AllowedGroups = []string{"yubivault-users"}
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	handler := p.requireMember(ok)
 
@@ -452,5 +468,198 @@ func TestRequireMember(t *testing.T) {
 	handler(rec, member)
 	if rec.Code != http.StatusOK {
 		t.Errorf("member should pass, got %d", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle and device pinning
+// ---------------------------------------------------------------------------
+
+func TestSessionFresh(t *testing.T) {
+	now := time.Now()
+	const maxAge = time.Hour
+	const idle = 30 * time.Minute
+
+	cases := []struct {
+		name     string
+		loginAt  time.Time
+		activeAt time.Time
+		want     bool
+	}{
+		{"recent", now.Add(-5 * time.Minute), now.Add(-time.Minute), true},
+		{"legacy zero timestamps", time.Time{}, time.Time{}, true},
+		{"beyond max age", now.Add(-2 * time.Hour), now.Add(-time.Minute), false},
+		{"idle timeout", now.Add(-10 * time.Minute), now.Add(-40 * time.Minute), false},
+	}
+	for _, tc := range cases {
+		if got := sessionFresh(tc.loginAt, tc.activeAt, now, maxAge, idle); got != tc.want {
+			t.Errorf("%s: sessionFresh = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSessionStateExpired(t *testing.T) {
+	p := newSessionPortal()
+
+	expired := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	old := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	seedSession(t, p, expired, map[string]any{
+		sessionIdentityK: "chris",
+		sessionTokenKey:  "token",
+		sessionLoginKey:  old,
+		sessionActiveKey: old,
+	})
+	auth, fresh := p.sessionState(expired)
+	if !auth {
+		t.Fatal("session with identity and token should be authenticated")
+	}
+	if fresh {
+		t.Error("session older than the max age must not be fresh")
+	}
+
+	active := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedSession(t, p, active, map[string]any{
+		sessionIdentityK: "chris",
+		sessionTokenKey:  "token",
+		sessionLoginKey:  now,
+		sessionActiveKey: now,
+	})
+	if auth, fresh := p.sessionState(active); !auth || !fresh {
+		t.Errorf("fresh session = (auth=%v, fresh=%v), want (true, true)", auth, fresh)
+	}
+}
+
+func TestPinnedDeviceErr(t *testing.T) {
+	p := testPortalWithConfig(&config.Config{})
+	p.config().Yubico.DeviceFingerprints = map[string][]string{
+		"chris": {"sha256:aaaa"},
+	}
+	if err := p.pinnedDeviceErr("chris", "sha256:aaaa"); err != nil {
+		t.Errorf("pinned match should pass: %v", err)
+	}
+	if err := p.pinnedDeviceErr("chris", "sha256:bbbb"); err == nil {
+		t.Error("pinned mismatch must be rejected")
+	}
+	if err := p.pinnedDeviceErr("chris", "SHA256:AAAA"); err != nil {
+		t.Errorf("fingerprint comparison should ignore case: %v", err)
+	}
+	if err := p.pinnedDeviceErr("dave", "sha256:bbbb"); err != nil {
+		t.Errorf("a CN without an entry is not pinned: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hot reload
+// ---------------------------------------------------------------------------
+
+// writeRoots creates a temporary PEM file with a self-signed CA certificate.
+func writeRoots(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test Yubico Root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	path := filepath.Join(t.TempDir(), "roots.pem")
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatalf("write roots: %v", err)
+	}
+	return path
+}
+
+// baseTestConfig returns a configuration that buildRuntime accepts.
+func baseTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	cfg := &config.Config{}
+	cfg.Server.SessionSecret = strings.Repeat("x", 40)
+	cfg.Vault.Address = "https://vault.example.com"
+	cfg.Vault.PKIMount = "pki"
+	cfg.Vault.PKIRole = "user"
+	cfg.OIDC.Issuer = "https://idp.example.com"
+	cfg.OIDC.ClientID = "client"
+	cfg.OIDC.RedirectURL = "https://portal.example.com/callback"
+	cfg.Yubico.RootCAFile = writeRoots(t)
+	return cfg
+}
+
+func TestOIDCConfigChanged(t *testing.T) {
+	a := baseTestConfig(t)
+	b := *a
+	if oidcConfigChanged(a, &b) {
+		t.Error("identical OIDC settings should not report a change")
+	}
+	b = *a
+	b.OIDC.Issuer = "https://other.example.com"
+	if !oidcConfigChanged(a, &b) {
+		t.Error("issuer change must be detected")
+	}
+	b = *a
+	b.OIDC.ClientID = "other"
+	if !oidcConfigChanged(a, &b) {
+		t.Error("client id change must be detected")
+	}
+	if !oidcConfigChanged(nil, a) {
+		t.Error("a nil previous config must report a change")
+	}
+}
+
+func TestReloadAppliesConfig(t *testing.T) {
+	cfg1 := baseTestConfig(t)
+	rt, err := buildRuntime(cfg1)
+	if err != nil {
+		t.Fatalf("buildRuntime: %v", err)
+	}
+	p := &Portal{logger: slog.Default()}
+	p.rt.Store(rt)
+
+	cfg2 := *cfg1
+	cfg2.UI.Title = "Reloaded Portal"
+	if err := p.Reload(&cfg2); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if p.config() != &cfg2 {
+		t.Errorf("config not swapped: got %p want %p", p.config(), &cfg2)
+	}
+	if got := p.config().UI.Title; got != "Reloaded Portal" {
+		t.Errorf("UI.Title = %q, want %q", got, "Reloaded Portal")
+	}
+	if p.attest() == rt.attest {
+		t.Error("derived attestation verifier should be rebuilt on reload")
+	}
+	if p.cookieStore() == rt.cookieStore {
+		t.Error("derived session store should be rebuilt on reload")
+	}
+}
+
+func TestReloadFailureKeepsConfig(t *testing.T) {
+	cfg1 := baseTestConfig(t)
+	rt, err := buildRuntime(cfg1)
+	if err != nil {
+		t.Fatalf("buildRuntime: %v", err)
+	}
+	p := &Portal{logger: slog.Default()}
+	p.rt.Store(rt)
+
+	bad := *cfg1
+	bad.Yubico.RootCAFile = filepath.Join(t.TempDir(), "missing.pem")
+	if err := p.Reload(&bad); err == nil {
+		t.Fatal("Reload must fail when the roots file is unreadable")
+	}
+	if p.config() != cfg1 {
+		t.Error("a failed reload must keep the previous configuration active")
 	}
 }

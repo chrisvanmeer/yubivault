@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"html/template"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func indexData(loggedIn bool) map[string]any {
 
 func TestTemplatesParse(t *testing.T) {
 	tmpl := parseTemplates(t)
-	for _, name := range []string{"index.html", "cert_modal.html", "confirm_revoke.html", "inventory.html", "manual_modal", "manual_nav"} {
+	for _, name := range []string{"index.html", "preview.html", "cert_modal.html", "confirm_revoke.html", "inventory.html", "manual_modal", "manual_nav"} {
 		if tmpl.Lookup(name) == nil {
 			t.Errorf("template %s is not registered", name)
 		}
@@ -143,6 +144,16 @@ func TestRenderIndex(t *testing.T) {
 			t.Errorf("logged-in index missing %q", want)
 		}
 	}
+	// The issue step is split: the form's primary button now verifies and
+	// previews (/api/preview-attest) instead of issuing immediately.
+	for _, want := range []string{`id="preview-btn"`, "/api/preview-attest", "verifyFiles()", "/api/sign-csr"} {
+		if !bytes.Contains([]byte(loggedIn), []byte(want)) {
+			t.Errorf("logged-in index missing preview wiring %q", want)
+		}
+	}
+	if bytes.Contains([]byte(loggedIn), []byte(`id="submit-btn"`)) {
+		t.Error("the main form should no longer render the final issue button")
+	}
 	if bytes.Contains([]byte(loggedIn), []byte(`\"chris\"`)) {
 		t.Error("certificate CN is double-quoted in the generated ykman command")
 	}
@@ -211,21 +222,59 @@ func TestRenderIndexManualNav(t *testing.T) {
 func TestRenderCertModal(t *testing.T) {
 	tmpl := parseTemplates(t)
 	out := render(t, tmpl, "cert_modal.html", issuedCert{
-		CertPEM:         "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
-		Serial:          "12:34:56",
-		CN:              "chris",
-		Slot:            "9a",
-		KeyType:         "eccp256",
-		NotAfter:        "2027-01-01 00:00 UTC",
-		Issued:          1,
-		Warnings:        []string{"heads up"},
-		YubiKeySerial:   "12345678",
-		YubiKeyFirmware: "5.4.3",
+		CertPEM:            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+		Serial:             "12:34:56",
+		CN:                 "chris",
+		Slot:               "9a",
+		KeyType:            "eccp256",
+		NotAfter:           "2027-01-01 00:00 UTC",
+		Issued:             1,
+		Warnings:           []string{"heads up"},
+		YubiKeySerial:      "12345678",
+		YubiKeyFirmware:    "5.4.3",
+		YubiKeyFingerprint: "sha256:" + strings.Repeat("a", 64),
 	})
-	for _, want := range []string{"CN=chris", "12:34:56", "ykman piv certificates import 9a user.crt", "Warnings", "heads up", "12345678", "5.4.3"} {
+	for _, want := range []string{"CN=chris", "12:34:56", "ykman piv certificates import 9a user.crt", "Warnings", "heads up", "12345678", "5.4.3", "Device fingerprint"} {
 		if !bytes.Contains([]byte(out), []byte(want)) {
 			t.Errorf("cert modal missing %q", want)
 		}
+	}
+}
+
+func TestRenderPreview(t *testing.T) {
+	tmpl := parseTemplates(t)
+	out := render(t, tmpl, "preview.html", attestPreview{
+		CN:              "chris",
+		Identity:        "Chris@Example.com",
+		Slot:            "9a",
+		KeyType:         "eccp256",
+		YubiKeySerial:   "12345678",
+		YubiKeyFirmware: "5.4.3",
+		Fingerprint:     "sha256:" + strings.Repeat("a", 64),
+		Pinned:          true,
+		RevokeExisting:  true,
+	})
+	for _, want := range []string{
+		"CN=chris", "12345678", "5.4.3", "Device fingerprint",
+		`id="submit-btn"`, "submitCSR()", "cancelPreview()",
+		"registered to your account", "revoked automatically",
+	} {
+		if !bytes.Contains([]byte(out), []byte(want)) {
+			t.Errorf("preview missing %q", want)
+		}
+	}
+	if bytes.Contains([]byte(out), []byte("{{")) {
+		t.Error("unrendered template action leaked into preview output")
+	}
+
+	// A device without a pinned entry must not claim it is registered, and a
+	// portal that keeps old certificates must not warn about revocation.
+	plain := render(t, tmpl, "preview.html", attestPreview{CN: "dave", Slot: "9c", KeyType: "rsa3072"})
+	if bytes.Contains([]byte(plain), []byte("registered to your account")) {
+		t.Error("unpinned device should not be shown as registered")
+	}
+	if bytes.Contains([]byte(plain), []byte("revoked automatically")) {
+		t.Error("revocation note should be hidden when revoke_existing is disabled")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -33,10 +35,21 @@ import (
 const (
 	maxUploadSize   = 2 << 20 // 2 MB upload limit
 	sessionName     = "yubivault_session"
-	sessionMaxAge   = 3600
 	oidcTimeout     = 15 * time.Second
 	oidcReadyTTL    = 60 * time.Second
 	limiterSweepAge = 10 * time.Minute
+)
+
+// Session value keys.
+const (
+	sessionLoginKey  = "user_login_at"
+	sessionActiveKey = "user_active_at"
+	sessionIdentityK = "user_identity"
+	sessionEmailKey  = "user_email"
+	sessionGroupsKey = "user_groups"
+	sessionTokenKey  = "raw_id_token"
+	sessionStateKey  = "oauth_state"
+	sessionNonceKey  = "oauth_nonce"
 )
 
 // Options wires the portal to its dependencies.
@@ -55,23 +68,59 @@ type Options struct {
 
 // Portal serves the YubiVault web interface.
 type Portal struct {
+	logger    *slog.Logger
+	templates *template.Template
+	static    http.Handler
+	audit     *audit.Logger
+
+	// rt holds the configuration together with every dependency that is
+	// derived from it. It is swapped atomically by Reload so a configuration
+	// change is applied live, without restarting the process and without
+	// racing in-flight requests.
+	rt atomic.Pointer[portalRuntime]
+
+	oidcMu       sync.Mutex
+	oidcCheckAt  time.Time
+	oidcCheckErr error
+}
+
+// portalRuntime bundles the live configuration with the components derived
+// from it. A single atomic snapshot keeps a request consistent even while a
+// reload swaps the whole set.
+type portalRuntime struct {
 	config        *config.Config
-	logger        *slog.Logger
 	attest        *attestation.Verifier
 	pki           *pki.Service
-	templates     *template.Template
-	static        http.Handler
 	cookieStore   *sessions.CookieStore
-	oauth2Config  oauth2.Config
+	oauth2Config  *oauth2.Config
 	oidcVerifier  *oidc.IDTokenVerifier
 	endSessionURL string
 	loginLimiter  *ipLimiter
 	signLimiter   *ipLimiter
-	audit         *audit.Logger
-	oidcMu        sync.Mutex
-	oidcCheckAt   time.Time
-	oidcCheckErr  error
 }
+
+// runtime returns the current configuration snapshot.
+func (p *Portal) runtime() *portalRuntime { return p.rt.Load() }
+
+// config returns the live configuration. Values read through it reflect the
+// most recent successful reload.
+func (p *Portal) config() *config.Config { return p.rt.Load().config }
+
+func (p *Portal) attest() *attestation.Verifier { return p.rt.Load().attest }
+
+func (p *Portal) pki() *pki.Service { return p.rt.Load().pki }
+
+func (p *Portal) cookieStore() *sessions.CookieStore { return p.rt.Load().cookieStore }
+
+func (p *Portal) oauth2Config() *oauth2.Config { return p.rt.Load().oauth2Config }
+
+func (p *Portal) oidcVerifier() *oidc.IDTokenVerifier { return p.rt.Load().oidcVerifier }
+
+func (p *Portal) endSessionURL() string { return p.rt.Load().endSessionURL }
+
+func (p *Portal) loginLimiter() *ipLimiter { return p.rt.Load().loginLimiter }
+
+func (p *Portal) signLimiter() *ipLimiter { return p.rt.Load().signLimiter }
 
 // New builds a fully wired Portal. It fails fast on configuration or
 // dependency problems so systemd reports a crash instead of a broken service.
@@ -86,24 +135,6 @@ func New(opts Options) (*Portal, error) {
 		logger = slog.Default()
 	}
 
-	roots, err := attestation.LoadRoots(cfg.Yubico.RootCAFile)
-	if err != nil {
-		return nil, err
-	}
-	verifier, err := attestation.New(attestation.Options{
-		Roots:           roots,
-		AllowedKeyTypes: cfg.AllowedKeyTypes(),
-		StrictSlotCheck: cfg.StrictSlotCheck(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	pkiSvc, err := pki.New(pkiOptions(cfg))
-	if err != nil {
-		return nil, err
-	}
-
 	// Templates is the embedded project root FS containing templates/*.html.
 	tmpl, err := template.ParseFS(opts.Templates, "templates/*.html")
 	if err != nil {
@@ -115,20 +146,48 @@ func New(opts Options) (*Portal, error) {
 		return nil, fmt.Errorf("failed to open embedded static assets: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), oidcTimeout)
-	defer cancel()
-
-	provider, err := oidc.NewProvider(ctx, cfg.OIDC.Issuer)
+	rt, err := buildRuntime(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to discover OIDC provider at %s: %w", cfg.OIDC.Issuer, err)
+		return nil, err
 	}
 
-	oauthCfg := oauth2.Config{
-		ClientID:     cfg.OIDC.ClientID,
-		ClientSecret: cfg.OIDC.ClientSecret,
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  cfg.OIDC.RedirectURL,
-		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+	ctx, cancel := context.WithTimeout(context.Background(), oidcTimeout)
+	defer cancel()
+	if err := configureOIDC(ctx, rt); err != nil {
+		return nil, err
+	}
+
+	p := &Portal{
+		logger:    logger,
+		templates: tmpl,
+		static:    http.FileServer(http.FS(staticFS)),
+		audit:     opts.Audit,
+	}
+	p.rt.Store(rt)
+	return p, nil
+}
+
+// buildRuntime constructs the configuration-derived dependencies. It performs
+// no network access, so it is cheap enough to call on every reload.
+func buildRuntime(cfg *config.Config) (*portalRuntime, error) {
+	roots, err := attestation.LoadRoots(cfg.Yubico.RootCAFile)
+	if err != nil {
+		return nil, err
+	}
+	verifier, err := attestation.New(attestation.Options{
+		Roots:           roots,
+		AllowedKeyTypes: cfg.AllowedKeyTypes(),
+		StrictSlotCheck: cfg.StrictSlotCheck(),
+		MinFirmware:     cfg.MinFirmware(),
+		MinSerial:       cfg.MinSerial(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	pkiSvc, err := pki.New(pkiOptions(cfg))
+	if err != nil {
+		return nil, err
 	}
 
 	// Single secret, two derived keys: a 64 byte HMAC key and a 32 byte AES
@@ -140,27 +199,87 @@ func New(opts Options) (*Portal, error) {
 	cookieStore := sessions.NewCookieStore(hashKey[:], blockKey[:])
 	cookieStore.Options = &sessions.Options{
 		Path:     "/",
-		MaxAge:   sessionMaxAge,
+		MaxAge:   int(cfg.SessionMaxAge().Seconds()),
 		HttpOnly: true,
 		Secure:   cfg.CookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 	}
 
-	return &Portal{
-		config:        cfg,
-		logger:        logger,
-		attest:        verifier,
-		pki:           pkiSvc,
-		templates:     tmpl,
-		static:        http.FileServer(http.FS(staticFS)),
-		cookieStore:   cookieStore,
-		oauth2Config:  oauthCfg,
-		oidcVerifier:  provider.Verifier(&oidc.Config{ClientID: cfg.OIDC.ClientID}),
-		endSessionURL: discoverEndSessionEndpoint(ctx, cfg.OIDC.Issuer),
-		loginLimiter:  newIPLimiter(cfg.RateLimitLogin(), cfg.RateLimitLogin()),
-		signLimiter:   newIPLimiter(cfg.RateLimitSign(), cfg.RateLimitSign()),
-		audit:         opts.Audit,
+	return &portalRuntime{
+		config:       cfg,
+		attest:       verifier,
+		pki:          pkiSvc,
+		cookieStore:  cookieStore,
+		loginLimiter: newIPLimiter(cfg.RateLimitLogin(), cfg.RateLimitLogin()),
+		signLimiter:  newIPLimiter(cfg.RateLimitSign(), cfg.RateLimitSign()),
 	}, nil
+}
+
+// configureOIDC performs OIDC discovery and stores the resulting verifier,
+// OAuth2 client and end-session endpoint on rt. It is the only step that
+// talks to the identity provider, so Reload calls it only when the OIDC
+// settings actually changed.
+func configureOIDC(ctx context.Context, rt *portalRuntime) error {
+	cfg := rt.config
+	provider, err := oidc.NewProvider(ctx, cfg.OIDC.Issuer)
+	if err != nil {
+		return fmt.Errorf("failed to discover OIDC provider at %s: %w", cfg.OIDC.Issuer, err)
+	}
+	rt.oauth2Config = &oauth2.Config{
+		ClientID:     cfg.OIDC.ClientID,
+		ClientSecret: cfg.OIDC.ClientSecret,
+		Endpoint:     provider.Endpoint(),
+		RedirectURL:  cfg.OIDC.RedirectURL,
+		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+	}
+	rt.oidcVerifier = provider.Verifier(&oidc.Config{ClientID: cfg.OIDC.ClientID})
+	rt.endSessionURL = discoverEndSessionEndpoint(ctx, cfg.OIDC.Issuer)
+	return nil
+}
+
+// Reload applies a freshly loaded configuration without restarting the
+// process. Per-request values (allowed groups, key types, CN template,
+// minimum firmware/serial, device fingerprints, session timeouts, ...) take
+// effect immediately. Dependencies derived from the configuration are rebuilt:
+// the attestation verifier, the Vault client, the rate limiters and the
+// session cookie store. A changed session_secret invalidates existing
+// sessions, and a changed OIDC provider is re-discovered, which requires the
+// identity provider to be reachable at reload time. When any rebuild fails the
+// previous configuration stays in effect and the error is returned.
+func (p *Portal) Reload(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("configuration is nil")
+	}
+	old := p.runtime()
+	rt, err := buildRuntime(cfg)
+	if err != nil {
+		return err
+	}
+	if old != nil && !oidcConfigChanged(old.config, cfg) {
+		rt.oauth2Config = old.oauth2Config
+		rt.oidcVerifier = old.oidcVerifier
+		rt.endSessionURL = old.endSessionURL
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), oidcTimeout)
+		defer cancel()
+		if err := configureOIDC(ctx, rt); err != nil {
+			return err
+		}
+	}
+	p.rt.Store(rt)
+	return nil
+}
+
+// oidcConfigChanged reports whether the OIDC settings that require a network
+// re-discovery changed between two configurations.
+func oidcConfigChanged(old, new *config.Config) bool {
+	if old == nil || new == nil {
+		return true
+	}
+	return old.OIDC.Issuer != new.OIDC.Issuer ||
+		old.OIDC.ClientID != new.OIDC.ClientID ||
+		old.OIDC.ClientSecret != new.OIDC.ClientSecret ||
+		old.OIDC.RedirectURL != new.OIDC.RedirectURL
 }
 
 // pkiOptions maps the shared Vault configuration to the PKI service options.
@@ -205,6 +324,8 @@ func Check(cfg *config.Config, logger *slog.Logger) error {
 		Roots:           roots,
 		AllowedKeyTypes: cfg.AllowedKeyTypes(),
 		StrictSlotCheck: cfg.StrictSlotCheck(),
+		MinFirmware:     cfg.MinFirmware(),
+		MinSerial:       cfg.MinSerial(),
 	}); err != nil {
 		record("attestation verifier", err)
 	}
@@ -238,17 +359,19 @@ func (p *Portal) Handler() http.Handler {
 	mux.Handle("/static/", http.StripPrefix("/static/", p.static))
 	mux.HandleFunc("/", p.handleIndex)
 
+	// The route table is fixed at startup. Endpoints that depend on a
+	// hot-reloadable flag (e.g. ui.certificates_enabled) stay registered and
+	// re-check the live configuration per request.
 	mux.HandleFunc("/login", p.rateLimit(p.loginLimiter, p.handleLogin))
 	mux.HandleFunc("/callback", p.handleCallback)
 	mux.HandleFunc("/logout", p.handleLogout)
-	if p.config.CertificatesEnabled() {
-		mux.HandleFunc("/certs", p.requireAuth(p.requireMember(p.handleInventory)))
-	}
+	mux.HandleFunc("/certs", p.requireAuth(p.requireMember(p.handleInventory)))
 
 	mux.HandleFunc("/manual/raw", p.requireAuth(p.requireMember(p.handleManualRaw)))
 	mux.HandleFunc("/manual/asset/", p.requireAuth(p.requireMember(p.handleManualAsset)))
 
 	mux.HandleFunc("/api/sign-csr", p.requireAuth(p.requireMember(p.rateLimit(p.signLimiter, p.handleSignCSR))))
+	mux.HandleFunc("/api/preview-attest", p.requireAuth(p.requireMember(p.rateLimit(p.signLimiter, p.handlePreviewAttest))))
 	mux.HandleFunc("/api/active-cert", p.requireAuth(p.requireMember(p.handleActiveCert)))
 
 	mux.HandleFunc("/healthz", p.handleHealthz)
@@ -289,14 +412,20 @@ func discoverEndSessionEndpoint(ctx context.Context, issuer string) string {
 // Session helpers
 // ---------------------------------------------------------------------------
 
-// loadSession reads the session and, when valid, re-saves it so the cookie
-// expiration slides forward on activity.
+// loadSession reads the session and, when it is still fresh, re-saves it so
+// the cookie expiration and the idle window slide forward on activity. An
+// expired session is saved untouched so the expiry is not silently reset.
 func (p *Portal) loadSession(w http.ResponseWriter, r *http.Request) (*sessions.Session, error) {
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err != nil {
 		return nil, err
 	}
 	if !session.IsNew {
+		now := time.Now()
+		if sessionFresh(sessionTime(session.Values[sessionLoginKey]), sessionTime(session.Values[sessionActiveKey]), now,
+			p.config().SessionMaxAge(), p.config().SessionIdleTimeout()) {
+			session.Values[sessionActiveKey] = now.UTC().Format(time.RFC3339)
+		}
 		if err := session.Save(r, w); err != nil {
 			return session, err
 		}
@@ -304,45 +433,105 @@ func (p *Portal) loadSession(w http.ResponseWriter, r *http.Request) (*sessions.
 	return session, nil
 }
 
+// sessionState reports whether the visitor is authenticated and whether the
+// session is still within its absolute maximum age and idle timeout.
+func (p *Portal) sessionState(r *http.Request) (authenticated, fresh bool) {
+	identity, token := p.sessionIdentity(r)
+	authenticated = identity != "" && token != ""
+	if !authenticated {
+		return authenticated, true
+	}
+	session, err := p.cookieStore().Get(r, sessionName)
+	if err != nil {
+		return authenticated, false
+	}
+	return authenticated, sessionFresh(sessionTime(session.Values[sessionLoginKey]), sessionTime(session.Values[sessionActiveKey]),
+		time.Now(), p.config().SessionMaxAge(), p.config().SessionIdleTimeout())
+}
+
+// sessionFresh reports whether a session with the given login and activity
+// timestamps is still valid under the max age and idle limits. Zero
+// timestamps (e.g. sessions created before this feature) stay valid.
+func sessionFresh(loginAt, activeAt, now time.Time, maxAge, idle time.Duration) bool {
+	if !loginAt.IsZero() && now.Sub(loginAt) > maxAge {
+		return false
+	}
+	if !activeAt.IsZero() && now.Sub(activeAt) > idle {
+		return false
+	}
+	return true
+}
+
+// sessionTime converts a stored RFC3339 timestamp back to a time.Time.
+func sessionTime(v any) time.Time {
+	s, _ := v.(string)
+	if s == "" {
+		return time.Time{}
+	}
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
+}
+
+// touchActivity slides the idle window of a valid session forward.
+func (p *Portal) touchActivity(w http.ResponseWriter, r *http.Request) {
+	session, err := p.cookieStore().Get(r, sessionName)
+	if err != nil {
+		return
+	}
+	session.Values[sessionActiveKey] = time.Now().UTC().Format(time.RFC3339)
+	_ = session.Save(r, w)
+}
+
+// invalidateSession clears every value and expires the cookie. It clones the
+// options so the shared store defaults are not mutated.
+func (p *Portal) invalidateSession(w http.ResponseWriter, r *http.Request) {
+	session, err := p.cookieStore().Get(r, sessionName)
+	if err != nil {
+		return
+	}
+	for k := range session.Values {
+		delete(session.Values, k)
+	}
+	opts := *session.Options
+	opts.MaxAge = -1
+	session.Options = &opts
+	_ = session.Save(r, w)
+}
+
 // sessionIdentity returns the OIDC identity and raw ID token, or empty
 // strings when the visitor is not authenticated.
 func (p *Portal) sessionIdentity(r *http.Request) (string, string) {
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err != nil {
 		return "", ""
 	}
-	identity, _ := session.Values["user_identity"].(string)
-	token, _ := session.Values["raw_id_token"].(string)
+	identity, _ := session.Values[sessionIdentityK].(string)
+	token, _ := session.Values[sessionTokenKey].(string)
 	return identity, token
 }
 
 // sessionEmail returns the OIDC email claim stored at login, or "" when the
 // visitor is not authenticated.
 func (p *Portal) sessionEmail(r *http.Request) string {
-	session, err := p.cookieStore.Get(r, sessionName)
+	session, err := p.cookieStore().Get(r, sessionName)
 	if err != nil {
 		return ""
 	}
-	email, _ := session.Values["user_email"].(string)
+	email, _ := session.Values[sessionEmailKey].(string)
 	return email
 }
 
 // certCN renders the administrator-configured certificate Common Name for an
 // identity and checks it against the configured pattern.
 func (p *Portal) certCN(identity, email string) (string, error) {
-	cn, err := attestation.RenderCN(identity, email, p.config.CNTemplate(), p.config.CNDomain())
+	cn, err := attestation.RenderCN(identity, email, p.config().CNTemplate(), p.config().CNDomain())
 	if err != nil {
 		return "", err
 	}
-	if err := p.config.ValidateCNPattern(cn); err != nil {
+	if err := p.config().ValidateCNPattern(cn); err != nil {
 		return "", err
 	}
 	return cn, nil
-}
-
-func (p *Portal) isAuthenticated(r *http.Request) bool {
-	identity, token := p.sessionIdentity(r)
-	return identity != "" && token != ""
 }
 
 func newOAuthState() string {
@@ -508,16 +697,22 @@ func (l *ipLimiter) allow(ip string) bool {
 	return v.lim.Allow()
 }
 
-// requireAuth rejects unauthenticated API calls with 401 so the client can
-// send the visitor through /login again.
+// requireAuth rejects unauthenticated or expired sessions with 401 so the
+// client can send the visitor through /login again. Expired sessions are
+// invalidated before the error is rendered.
 func (p *Portal) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !p.isAuthenticated(r) {
+		authenticated, fresh := p.sessionState(r)
+		if !authenticated || !fresh {
+			if authenticated {
+				p.invalidateSession(w, r)
+			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = sessionExpiredTemplate.Execute(w, nil)
 			return
 		}
+		p.touchActivity(w, r)
 		next(w, r)
 	}
 }
@@ -554,9 +749,12 @@ var notMemberTemplate = template.Must(template.New("not-member").Parse(
 		<a href="/logout" class="inline-flex items-center px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition shadow-sm">Log out</a>
 	</div>`))
 
-func (p *Portal) rateLimit(limiter *ipLimiter, next http.HandlerFunc) http.HandlerFunc {
+// rateLimit guards a handler with a per-IP token bucket. The limiter is
+// resolved per request through getLimiter so a reload can swap in new rate
+// limits without rebuilding the route table.
+func (p *Portal) rateLimit(getLimiter func() *ipLimiter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !limiter.allow(clientIP(r)) {
+		if !getLimiter().allow(clientIP(r)) {
 			renderError(w, http.StatusTooManyRequests,
 				"Too many requests. Please wait a moment and try again.")
 			return

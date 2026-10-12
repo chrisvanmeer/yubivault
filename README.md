@@ -12,10 +12,14 @@ YubiVault is an airgapped **Validation Middleware & Vault Delegation Proxy** for
 - **Yubico Root CA Chain Validation**: Validates the YubiKey attestation certificate chain against official Yubico Root CAs.
 - **OIDC Authentication & Delegation**: Authenticates users via OIDC (Keycloak, Entra ID, Authelia, Okta) and exchanges the user's raw ID token with Vault JWT auth, maintaining strict Vault entity alias mapping.
 - **Customizable Branding**: Configurable application title and short title via `config.yaml`.
-- **Audit Trail**: Append-only JSONL audit log of logins, certificate issuance, denials and revocations, including the YubiKey serial and firmware (never ID tokens or secrets).
+- **Audit Trail**: Append-only, hash-chained JSONL audit log of logins, certificate issuance, denials and revocations, including the YubiKey serial, firmware and device fingerprint (never ID tokens or secrets). Tamper-evident, with a `--verify-audit` CLI check.
 - **OIDC Group Authorization**: Optionally restrict certificate issuance (and the inventory/manual pages) to users holding an allowed OIDC group.
-- **YubiKey Identity Capture**: The YubiKey serial number and firmware version are extracted from the attestation certificate and shown on issuance.
+- **YubiKey Identity Capture & Preview**: The YubiKey serial number, firmware and a stable device fingerprint are extracted from the attestation certificate and shown in a confirmation step before anything is issued.
+- **Device Policy & Pinning**: Enforce a minimum YubiKey firmware and serial (fail-closed), and optionally pin each Common Name to one or more known device fingerprints.
+- **Session Timeouts**: Absolute maximum session age and an inactivity timeout, both configurable.
+- **Live Configuration Reload**: `config.yaml` is re-read every 10 seconds and applied without a restart; a reload is logged only when a change is actually detected.
 - **`--check-config` CLI**: Validate the configuration, Yubico roots, Vault/AppRole connectivity and OIDC discovery without starting the service.
+- **`--verify-audit` CLI**: Verify the integrity of the audit trail's hash chain.
 - **Rich Readiness Probe**: `/readyz` reports Vault reachability, OIDC discovery and (when enabled) AppRole authentication.
 - **Systemd Management**: Built-in `--install` and `--uninstall` flags for automated systemd service management and production deployment to `/etc/yubivault` and `/usr/local/bin/yubivault`.
 - **Airgapped Design**: Dependencies (HTMX, Tailwind CSS, Favicon, Yubico Root CAs) are served entirely locally without third-party CDNs or runtime internet access.
@@ -166,6 +170,11 @@ Create `config.yaml` in the project root or `/etc/yubivault/config.yaml`. A
 fully commented reference lives in `config.yaml.example`; omitted options fall
 back to the defaults noted below.
 
+The file is reloaded at runtime: it is re-read every 10 seconds and, when its
+contents changed, the new configuration is applied live without a restart (a
+reload is logged only when a change is detected). The listen address and the
+log/audit destinations still require a restart.
+
 ```yaml
 server:
   listen_addr: "127.0.0.1:8080"
@@ -178,6 +187,10 @@ server:
   #   local development, never in production.
   # rate_limit_login_per_min: 10 -> defaults to 10 (per client IP)
   # rate_limit_sign_per_min: 10  -> defaults to 10 (per client IP)
+  # Session lifetime (Go duration strings):
+  #   session_max_age: "1h"        # absolute lifetime; defaults to 1h
+  #   session_idle_timeout: "30m"  # logout after inactivity; defaults to 30m.
+  #                                # Must not exceed session_max_age.
 
 ui:
   title: "YubiVault Portal"
@@ -262,6 +275,16 @@ yubico:
   # strict_slot_check: true -> defaults to true. Requires the attestation
   #   subject to name the PIV slot the user selected.
   # rsa_bits: 3072  # legacy single-type setting, superseded by key_types
+  # Optional device policy. Both minima are fail-closed: a YubiKey that does not
+  # report the value, or reports an older one, is rejected.
+  #   min_firmware: "5.4.3"  # require this firmware version or newer
+  #   min_serial: "1000000"  # require this serial number or higher
+  # Optional per-Common-Name device pinning. When a CN has an entry, only those
+  # exact devices (by fingerprint) may be issued a certificate. CNs without an
+  # entry accept any YubiKey.
+  # device_fingerprints:
+  #   chris:
+  #     - "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 logging:
   # Directory for log files. Defaults to /var/log/yubivault. Set to "" to log
@@ -276,6 +299,8 @@ logging:
 audit:
   # Append-only JSONL audit trail of logins, issuance, denials and revocations.
   # Enabled by default and fail-fast: an enabled audit log must be writable.
+  # Every record is hash-chained to the previous line; tampering breaks the
+  # chain and is reported by `yubivault --verify-audit`.
   #   enabled: true
   #   dir: "/var/log/yubivault"   # defaults to logging.dir
   #   file: "audit.log"           # rotated by the same logrotate snippet
@@ -413,6 +438,20 @@ This loads and validates the config, checks the Yubico root CAs, reaches out to
 Vault (and performs an AppRole login when `revoke_existing` is enabled), and
 performs OIDC discovery. It exits non-zero on any failure.
 
+### Verify the Audit Trail
+
+The audit log is hash-chained: every record commits to the previous one, so any
+edit, reorder or deletion breaks the chain at the next record. Verify it with:
+
+```bash
+./yubivault --verify-audit
+```
+
+It prints `audit trail OK: <path>` and exits zero when the chain is intact, and
+exits non-zero (logging the first broken line number) when it is not. When the
+audit trail is disabled it prints a note and exits zero. Run it against the
+audit log configured under `audit:`.
+
 ### Systemd Service Installation (Production)
 
 To install YubiVault as a managed systemd service:
@@ -545,8 +584,8 @@ End users perform the following steps to request an attested certificate:
    ykman piv certificates export f9 intermediate.crt
    ```
 
-4. **Upload Files & Submit**: Drag & drop `user.csr`, `attest.crt`, and `intermediate.crt` into Step 3 upload zones, then click **Verify & Issue Certificate**.
-5. **Confirm Revocation Warning** (if prompted by modal when `revoke_existing` is enabled).
+4. **Upload Files & Preview**: Drag & drop `user.csr`, `attest.crt`, and `intermediate.crt` into Step 3 upload zones, then click **Verify & Preview**. The portal verifies the attestation and shows the YubiKey serial, firmware and device fingerprint; nothing is issued yet.
+5. **Confirm & Issue**: Review the device identity and click **Verify & Issue Certificate** (or **Cancel**). If `revoke_existing` is enabled and an active certificate exists, a revocation warning modal appears first.
 6. **Download Certificate & Import**:
    - Download the issued `user.crt` into the **same working directory** where terminal commands were run.
    - Run the import command provided in the success modal:

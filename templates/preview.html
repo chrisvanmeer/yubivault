@@ -1,0 +1,81 @@
+<!-- Attestation preview: step 1 of the issuance wizard. Nothing is signed
+     until the user confirms here. The uploaded files are still in the form, so
+     the "Verify & Issue" button (submitCSR) re-submits them to /api/sign-csr,
+     where the attestation is verified again before anything is issued. -->
+<div class="animate-slide-up rounded-2xl border border-blue-200 dark:border-blue-800/60 bg-blue-50/70 dark:bg-blue-900/20 p-4 sm:p-5">
+    <div class="flex items-start gap-3">
+        <span class="flex-shrink-0 h-9 w-9 rounded-full bg-blue-100 dark:bg-blue-900/50 flex items-center justify-center">
+            <svg class="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622C17.176 19.29 21 14.591 21 9c0-1.042-.133-2.052-.382-3.016z" />
+            </svg>
+        </span>
+        <div class="min-w-0">
+            <h3 class="text-sm font-bold text-slate-900 dark:text-white">YubiKey verified</h3>
+            <p class="text-xs text-slate-600 dark:text-slate-300">
+                Confirm this is your device before the certificate is created. No certificate has been issued yet.
+            </p>
+        </div>
+    </div>
+
+    <!-- Device & request summary -->
+    <div class="mt-4 rounded-xl bg-white/80 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 p-3 text-xs space-y-1.5">
+        <div class="flex items-center justify-between gap-3">
+            <span class="text-slate-500 dark:text-slate-400 whitespace-nowrap">Common Name</span>
+            <span class="font-mono font-bold text-slate-900 dark:text-white truncate max-w-[200px]" title="{{.CN}}">CN={{.CN}}</span>
+        </div>
+        <div class="flex items-center justify-between gap-3">
+            <span class="text-slate-500 dark:text-slate-400">Slot &middot; key type</span>
+            <span class="font-semibold text-slate-700 dark:text-slate-300">{{.Slot}} &middot; <span data-keytype-label>{{.KeyType}}</span></span>
+        </div>
+        {{if .YubiKeySerial}}
+        <div class="flex items-center justify-between gap-3">
+            <span class="text-slate-500 dark:text-slate-400 whitespace-nowrap">YubiKey serial</span>
+            <span class="font-mono font-semibold text-slate-700 dark:text-slate-300">{{.YubiKeySerial}}</span>
+        </div>
+        {{end}}
+        {{if .YubiKeyFirmware}}
+        <div class="flex items-center justify-between gap-3">
+            <span class="text-slate-500 dark:text-slate-400">Firmware</span>
+            <span class="font-semibold text-slate-700 dark:text-slate-300">{{.YubiKeyFirmware}}</span>
+        </div>
+        {{end}}
+        {{if .Fingerprint}}
+        <div class="flex items-center justify-between gap-3">
+            <span class="text-slate-500 dark:text-slate-400 whitespace-nowrap">Device fingerprint</span>
+            <span class="font-mono text-[10px] text-slate-500 dark:text-slate-400 truncate max-w-[200px]" title="{{.Fingerprint}}">{{.Fingerprint}}</span>
+        </div>
+        {{end}}
+    </div>
+
+    {{if .Pinned}}
+    <p class="mt-3 flex items-center gap-1.5 text-[11px] text-emerald-700 dark:text-emerald-400">
+        <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M5 13l4 4L19 7" />
+        </svg>
+        This device is registered to your account.
+    </p>
+    {{end}}
+
+    {{if .RevokeExisting}}
+    <p class="mt-3 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+        If you already hold an active certificate, it will be revoked automatically after the new one is issued.
+    </p>
+    {{end}}
+
+    <div class="mt-4 flex flex-col sm:flex-row gap-2">
+        <button id="submit-btn" type="button" onclick="submitCSR()"
+            class="btn-primary flex-1 inline-flex items-center justify-center gap-2 text-sm">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Verify &amp; Issue Certificate
+        </button>
+        <button type="button" onclick="cancelPreview()"
+            class="flex-1 inline-flex items-center justify-center gap-2 text-sm font-bold px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700/60 transition cursor-pointer">
+            Cancel
+        </button>
+    </div>
+</div>

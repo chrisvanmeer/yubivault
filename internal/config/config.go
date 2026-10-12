@@ -28,7 +28,21 @@ const (
 	// DefaultCNPattern is the default cn.pattern: a shell-safe set of
 	// characters, at most 64 long. It is matched against the whole CN.
 	DefaultCNPattern = "[a-z0-9._+@-]{1,64}"
+
+	// defaultSessionMaxAge is the absolute login session lifetime.
+	defaultSessionMaxAge = time.Hour
+	// defaultSessionIdleTimeout is the per-session inactivity limit.
+	defaultSessionIdleTimeout = 30 * time.Minute
 )
+
+// versionRe accepts a firmware version such as "5.4.3" or "2.4.4".
+var versionRe = regexp.MustCompile(`^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$`)
+
+// unsignedRe accepts a non-negative integer such as a YubiKey serial number.
+var unsignedRe = regexp.MustCompile(`^[0-9]+$`)
+
+// deviceFPRe accepts a normalized device fingerprint "sha256:" + 64 hex.
+var deviceFPRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // cnPlaceholders are the placeholders understood in cn.template.
 var cnPlaceholders = []string{"{user}", "{email}", "{domain}"}
@@ -69,6 +83,12 @@ type Config struct {
 		CookieSecure   *bool  `yaml:"cookie_secure"`
 		RateLimitLogin int    `yaml:"rate_limit_login_per_min"`
 		RateLimitSign  int    `yaml:"rate_limit_sign_per_min"`
+		// SessionMaxAge bounds the absolute lifetime of a login session
+		// (default 1h), regardless of activity.
+		SessionMaxAge string `yaml:"session_max_age"`
+		// SessionIdleTimeout logs a user out when they have not made a request
+		// for this long (default 30m). It must not exceed SessionMaxAge.
+		SessionIdleTimeout string `yaml:"session_idle_timeout"`
 	} `yaml:"server"`
 	UI struct {
 		Title               string `yaml:"title"`
@@ -139,6 +159,20 @@ type Config struct {
 		RSABits         int      `yaml:"rsa_bits"` // legacy, superseded by key_types
 		KeyTypes        []string `yaml:"key_types"`
 		StrictSlotCheck *bool    `yaml:"strict_slot_check"`
+		// MinFirmware rejects YubiKeys whose attestation reports a firmware
+		// version below the given major.minor.patch. An attestation without a
+		// firmware version is also rejected (fail-closed). Empty disables.
+		MinFirmware string `yaml:"min_firmware"`
+		// MinSerial rejects YubiKeys whose attestation serial number is below
+		// this value. An attestation without a serial is also rejected when
+		// set (fail-closed). Empty disables.
+		MinSerial string `yaml:"min_serial"`
+		// DeviceFingerprints is an optional per-Common-Name allowlist of device
+		// fingerprints (sha256:...) from the attestation certificate public
+		// key. Only Common Names listed here are pinned; when a CN has no
+		// entry its key may be used from any device. The fingerprint is always
+		// recorded in the audit trail.
+		DeviceFingerprints map[string][]string `yaml:"device_fingerprints"`
 	} `yaml:"yubico"`
 	Logging struct {
 		// Dir is the directory log files are written to. A nil value selects
@@ -176,6 +210,22 @@ func boolOr(p *bool, def bool) bool {
 
 // CookieSecure reports whether session cookies carry the Secure attribute.
 func (c *Config) CookieSecure() bool { return boolOr(c.Server.CookieSecure, true) }
+
+// SessionMaxAge is the absolute lifetime of a login session.
+func (c *Config) SessionMaxAge() time.Duration {
+	if d, err := time.ParseDuration(c.Server.SessionMaxAge); err == nil {
+		return d
+	}
+	return defaultSessionMaxAge
+}
+
+// SessionIdleTimeout is the inactivity limit of a login session.
+func (c *Config) SessionIdleTimeout() time.Duration {
+	if d, err := time.ParseDuration(c.Server.SessionIdleTimeout); err == nil {
+		return d
+	}
+	return defaultSessionIdleTimeout
+}
 
 // StrictSlotCheck reports whether the attestation subject must name the PIV
 // slot the user selected.
@@ -393,6 +443,24 @@ func (c *Config) applyDefaults() {
 		}
 		c.OIDC.AllowedGroups = trimmed
 	}
+	if len(c.Yubico.DeviceFingerprints) > 0 {
+		normalized := make(map[string][]string, len(c.Yubico.DeviceFingerprints))
+		for cn, fps := range c.Yubico.DeviceFingerprints {
+			if cn = strings.ToLower(strings.TrimSpace(cn)); cn == "" {
+				continue
+			}
+			var clean []string
+			for _, fp := range fps {
+				if fp = strings.ToLower(strings.TrimSpace(fp)); fp != "" {
+					clean = append(clean, fp)
+				}
+			}
+			if len(clean) > 0 {
+				normalized[cn] = clean
+			}
+		}
+		c.Yubico.DeviceFingerprints = normalized
+	}
 }
 
 // LogDir returns the directory log files are written to. It returns an empty
@@ -446,6 +514,18 @@ func (c *Config) AuditFilePath() string {
 // AllowedGroups returns the OIDC groups allowed to issue certificates. Empty
 // means every authenticated user.
 func (c *Config) AllowedGroups() []string { return c.OIDC.AllowedGroups }
+
+// MinFirmware returns the minimum required YubiKey firmware version, or "".
+func (c *Config) MinFirmware() string { return c.Yubico.MinFirmware }
+
+// MinSerial returns the minimum required YubiKey serial number, or "".
+func (c *Config) MinSerial() string { return c.Yubico.MinSerial }
+
+// DeviceFingerprints returns the normalized per-Common-Name device fingerprint
+// allowlist. It is always non-nil (possibly empty).
+func (c *Config) DeviceFingerprints() map[string][]string {
+	return c.Yubico.DeviceFingerprints
+}
 
 // GroupsClaim returns the ID token claim carrying the user's groups.
 func (c *Config) GroupsClaim() string {
@@ -511,6 +591,47 @@ func (c *Config) Validate() error {
 	}
 	if c.OIDC.RedirectURL == "" {
 		errs = append(errs, "oidc.redirect_url is required (e.g. https://yubivault.example.com/callback)")
+	}
+
+	for _, d := range []struct{ name, val string }{
+		{"server.session_max_age", c.Server.SessionMaxAge},
+		{"server.session_idle_timeout", c.Server.SessionIdleTimeout},
+	} {
+		if d.val == "" {
+			continue
+		}
+		if p, err := time.ParseDuration(d.val); err != nil {
+			errs = append(errs, fmt.Sprintf(
+				"%s must be a Go duration such as '8h' or '30m' (got '%s')", d.name, d.val))
+		} else if p <= 0 {
+			errs = append(errs, fmt.Sprintf("%s must be a positive duration (got '%s')", d.name, d.val))
+		}
+	}
+	if c.SessionIdleTimeout() > c.SessionMaxAge() {
+		errs = append(errs,
+			fmt.Sprintf("server.session_idle_timeout (%s) must not exceed server.session_max_age (%s)",
+				c.SessionIdleTimeout(), c.SessionMaxAge()))
+	}
+
+	if c.Yubico.MinFirmware != "" && !versionRe.MatchString(c.Yubico.MinFirmware) {
+		errs = append(errs, fmt.Sprintf(
+			"yubico.min_firmware must be a firmware version such as '5.4.3' (got '%s')", c.Yubico.MinFirmware))
+	}
+	if c.Yubico.MinSerial != "" && !unsignedRe.MatchString(c.Yubico.MinSerial) {
+		errs = append(errs, fmt.Sprintf(
+			"yubico.min_serial must be a non-negative integer (got '%s')", c.Yubico.MinSerial))
+	}
+	for cn, fps := range c.Yubico.DeviceFingerprints {
+		if cn == "" {
+			errs = append(errs, "yubico.device_fingerprints keys must not be empty")
+			continue
+		}
+		for _, fp := range fps {
+			if !deviceFPRe.MatchString(fp) {
+				errs = append(errs, fmt.Sprintf(
+					"yubico.device_fingerprints[%s]: '%s' must look like 'sha256:' followed by 64 hex characters", cn, fp))
+			}
+		}
 	}
 
 	if err := validateCNTemplate(c.CN.Template, c.CN.Domain); err != nil {
