@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -82,6 +81,12 @@ type Portal struct {
 	oidcMu       sync.Mutex
 	oidcCheckAt  time.Time
 	oidcCheckErr error
+
+	// manuals caches rendered manual documents. Rendering runs goldmark, so it
+	// is memoised and only redone when a manual file changes on disk. The cache
+	// lives on the Portal (not the swappable runtime) so it survives reloads.
+	manualsOnce sync.Once
+	manuals     *manualRenderCache
 }
 
 // portalRuntime bundles the live configuration with the components derived
@@ -233,7 +238,14 @@ func configureOIDC(ctx context.Context, rt *portalRuntime) error {
 		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 	}
 	rt.oidcVerifier = provider.Verifier(&oidc.Config{ClientID: cfg.OIDC.ClientID})
-	rt.endSessionURL = discoverEndSessionEndpoint(ctx, cfg.OIDC.Issuer)
+	// The end-session endpoint rides along in the discovery document we just
+	// fetched, so there is no need for a second request to /.well-known.
+	var claims struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	if err := provider.Claims(&claims); err == nil {
+		rt.endSessionURL = claims.EndSessionEndpoint
+	}
 	return nil
 }
 
@@ -384,51 +396,55 @@ func (p *Portal) Handler() http.Handler {
 	return handler
 }
 
-// discoverEndSessionEndpoint looks up the IdP's RP-initiated logout endpoint.
-// It is optional: when unavailable, logout stays a local session clear.
-func discoverEndSessionEndpoint(ctx context.Context, issuer string) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Warn("could not discover OIDC end_session_endpoint", "error", err)
-		return ""
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var doc struct {
-		EndSessionEndpoint string `json:"end_session_endpoint"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return ""
-	}
-	return doc.EndSessionEndpoint
-}
-
 // ---------------------------------------------------------------------------
 // Session helpers
 // ---------------------------------------------------------------------------
 
-// loadSession reads the session and, when it is still fresh, re-saves it so
-// the cookie expiration and the idle window slide forward on activity. An
-// expired session is saved untouched so the expiry is not silently reset.
+// session returns the request's decoded session. gorilla/sessions keeps a
+// per-request registry (attached to the request context on first use) and
+// reuses it for later lookups, so the encrypted cookie is decoded and verified
+// at most once per request even though several helpers need it.
+func (p *Portal) session(r *http.Request) (*sessions.Session, error) {
+	return p.cookieStore().Get(r, sessionName)
+}
+
+// sessionSaveInterval throttles how often an active session cookie is rewritten
+// while sliding its expiry. It is half the idle window, capped at one minute,
+// so a request burst does not re-encrypt and re-send the cookie every time.
+func (p *Portal) sessionSaveInterval() time.Duration {
+	interval := p.config().SessionIdleTimeout() / 2
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	return interval
+}
+
+// loadSession reads the session and, when it is still fresh, re-saves it so the
+// cookie expiration and the idle window slide forward on activity. The rewrite
+// is throttled to sessionSaveInterval. An expired session is left untouched so
+// its expiry is not silently reset.
 func (p *Portal) loadSession(w http.ResponseWriter, r *http.Request) (*sessions.Session, error) {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		return nil, err
 	}
-	if !session.IsNew {
-		now := time.Now()
-		if sessionFresh(sessionTime(session.Values[sessionLoginKey]), sessionTime(session.Values[sessionActiveKey]), now,
-			p.config().SessionMaxAge(), p.config().SessionIdleTimeout()) {
-			session.Values[sessionActiveKey] = now.UTC().Format(time.RFC3339)
-		}
-		if err := session.Save(r, w); err != nil {
-			return session, err
-		}
+	if session.IsNew {
+		return session, nil
+	}
+	now := time.Now()
+	if !sessionFresh(sessionTime(session.Values[sessionLoginKey]), sessionTime(session.Values[sessionActiveKey]),
+		now, p.config().SessionMaxAge(), p.config().SessionIdleTimeout()) {
+		return session, nil
+	}
+	if now.Sub(sessionTime(session.Values[sessionActiveKey])) < p.sessionSaveInterval() {
+		return session, nil
+	}
+	session.Values[sessionActiveKey] = now.UTC().Format(time.RFC3339)
+	if err := session.Save(r, w); err != nil {
+		return session, err
 	}
 	return session, nil
 }
@@ -436,14 +452,15 @@ func (p *Portal) loadSession(w http.ResponseWriter, r *http.Request) (*sessions.
 // sessionState reports whether the visitor is authenticated and whether the
 // session is still within its absolute maximum age and idle timeout.
 func (p *Portal) sessionState(r *http.Request) (authenticated, fresh bool) {
-	identity, token := p.sessionIdentity(r)
+	session, err := p.session(r)
+	if err != nil {
+		return false, true
+	}
+	identity, _ := session.Values[sessionIdentityK].(string)
+	token, _ := session.Values[sessionTokenKey].(string)
 	authenticated = identity != "" && token != ""
 	if !authenticated {
 		return authenticated, true
-	}
-	session, err := p.cookieStore().Get(r, sessionName)
-	if err != nil {
-		return authenticated, false
 	}
 	return authenticated, sessionFresh(sessionTime(session.Values[sessionLoginKey]), sessionTime(session.Values[sessionActiveKey]),
 		time.Now(), p.config().SessionMaxAge(), p.config().SessionIdleTimeout())
@@ -472,20 +489,25 @@ func sessionTime(v any) time.Time {
 	return t
 }
 
-// touchActivity slides the idle window of a valid session forward.
+// touchActivity slides the idle window of a valid session forward, throttled to
+// sessionSaveInterval so frequent requests do not rewrite the cookie each time.
 func (p *Portal) touchActivity(w http.ResponseWriter, r *http.Request) {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		return
 	}
-	session.Values[sessionActiveKey] = time.Now().UTC().Format(time.RFC3339)
+	now := time.Now()
+	if now.Sub(sessionTime(session.Values[sessionActiveKey])) < p.sessionSaveInterval() {
+		return
+	}
+	session.Values[sessionActiveKey] = now.UTC().Format(time.RFC3339)
 	_ = session.Save(r, w)
 }
 
 // invalidateSession clears every value and expires the cookie. It clones the
 // options so the shared store defaults are not mutated.
 func (p *Portal) invalidateSession(w http.ResponseWriter, r *http.Request) {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		return
 	}
@@ -501,7 +523,7 @@ func (p *Portal) invalidateSession(w http.ResponseWriter, r *http.Request) {
 // sessionIdentity returns the OIDC identity and raw ID token, or empty
 // strings when the visitor is not authenticated.
 func (p *Portal) sessionIdentity(r *http.Request) (string, string) {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		return "", ""
 	}
@@ -513,7 +535,7 @@ func (p *Portal) sessionIdentity(r *http.Request) (string, string) {
 // sessionEmail returns the OIDC email claim stored at login, or "" when the
 // visitor is not authenticated.
 func (p *Portal) sessionEmail(r *http.Request) string {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		return ""
 	}

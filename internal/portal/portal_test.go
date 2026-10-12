@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -661,5 +662,145 @@ func TestReloadFailureKeepsConfig(t *testing.T) {
 	}
 	if p.config() != cfg1 {
 		t.Error("a failed reload must keep the previous configuration active")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resource usage: session reuse, manual caching and streaming
+// ---------------------------------------------------------------------------
+
+func TestSessionRefreshThrottled(t *testing.T) {
+	p := newSessionPortal()
+
+	recent := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedSession(t, p, recent, map[string]any{
+		sessionIdentityK: "chris",
+		sessionTokenKey:  "token",
+		sessionLoginKey:  now,
+		sessionActiveKey: now,
+	})
+	rec := httptest.NewRecorder()
+	p.touchActivity(rec, recent)
+	if rec.Header().Get("Set-Cookie") != "" {
+		t.Error("a recently active session must not be re-saved on every request")
+	}
+
+	stale := httptest.NewRequest(http.MethodGet, "http://portal/", nil)
+	old := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+	seedSession(t, p, stale, map[string]any{
+		sessionIdentityK: "chris",
+		sessionTokenKey:  "token",
+		sessionLoginKey:  old,
+		sessionActiveKey: old,
+	})
+	rec = httptest.NewRecorder()
+	p.touchActivity(rec, stale)
+	if rec.Header().Get("Set-Cookie") == "" {
+		t.Error("an idle session past the throttle interval should be refreshed")
+	}
+}
+
+func TestManualRenderCache(t *testing.T) {
+	p := testPortalWithConfig(&config.Config{})
+	file := filepath.Join(t.TempDir(), "manual.md")
+	if err := os.WriteFile(file, []byte("# One\n\nfirst content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	doc1, ok := p.loadManualDoc("macos", file)
+	if !ok || !strings.Contains(string(doc1.HTML), "first content") {
+		t.Fatalf("first render = %+v; want the markdown body", doc1)
+	}
+	if doc2, ok := p.loadManualDoc("macos", file); !ok || doc2.HTML != doc1.HTML {
+		t.Error("an unchanged manual should render identically")
+	}
+
+	// A cache hit must not touch the file again: capture the stat signature,
+	// remove the file, and render with the stale info.
+	info, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, ok := p.renderManual(file, info)
+	if !ok {
+		t.Fatal("render failed")
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if r2, ok := p.renderManual(file, info); !ok || r2.html != r1.html {
+		t.Error("an unchanged file should be served from the render cache")
+	}
+
+	// When the file changes the cache invalidates and the new body appears.
+	if err := os.WriteFile(file, []byte("# Two\n\nsecond content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(file, future, future); err != nil {
+		t.Fatal(err)
+	}
+	doc3, ok := p.loadManualDoc("macos", file)
+	if !ok || !strings.Contains(string(doc3.HTML), "second content") {
+		t.Errorf("a changed manual should re-render, got %q", doc3.HTML)
+	}
+}
+
+func TestManualRenderCacheConcurrent(t *testing.T) {
+	p := testPortalWithConfig(&config.Config{})
+	file := filepath.Join(t.TempDir(), "manual.md")
+	if err := os.WriteFile(file, []byte("# Hi\n\nbody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, ok := p.loadManualDoc("macos", file); !ok {
+				t.Error("concurrent manual render failed")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestHandleManualRawStreams(t *testing.T) {
+	p := testPortalWithConfig(&config.Config{})
+	dir := t.TempDir()
+	file := filepath.Join(dir, "manual.md")
+	body := "# Hello\n\nstreaming body"
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.config().UI.ManualFile = file
+
+	rec := httptest.NewRecorder()
+	p.handleManualRaw(rec, httptest.NewRequest(http.MethodGet, "/manual/raw?os=default", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/markdown") {
+		t.Errorf("content type = %q, want text/markdown", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "inline") {
+		t.Errorf("disposition = %q, want inline", cd)
+	}
+	if rec.Body.String() != body {
+		t.Errorf("body = %q, want %q", rec.Body.String(), body)
+	}
+
+	// ServeContent adds Range support for free.
+	rangeReq := httptest.NewRequest(http.MethodGet, "/manual/raw?os=default", nil)
+	rangeReq.Header.Set("Range", "bytes=0-4")
+	rec = httptest.NewRecorder()
+	p.handleManualRaw(rec, rangeReq)
+	if rec.Code != http.StatusPartialContent {
+		t.Errorf("range status = %d, want 206", rec.Code)
+	}
+	if rec.Body.String() != "# Hel" {
+		t.Errorf("range body = %q, want %q", rec.Body.String(), "# Hel")
 	}
 }

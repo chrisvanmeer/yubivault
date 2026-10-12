@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -205,5 +206,68 @@ func TestVerifyDetectsInvalidJSON(t *testing.T) {
 	line, err := Verify(path)
 	if err == nil || line != 1 {
 		t.Fatalf("Verify = (%d, %v), want (1, error)", line, err)
+	}
+}
+
+// TestOpenResumesChainFromTail writes more than the tail window so reopening
+// has to locate the final record by reading only the end of the file, then
+// proves the resumed chain still verifies end to end.
+func TestOpenResumesChainFromTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := strings.Repeat("x", 200)
+	for i := 0; i < 500; i++ {
+		l.Log(Event{Event: EventIssue, Outcome: OutcomeSuccess, Identity: "chris", Reason: reason})
+	}
+	_ = l.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() <= tailWindow {
+		t.Fatalf("test needs a log larger than the %d-byte tail window, got %d", tailWindow, info.Size())
+	}
+
+	l2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2.Log(Event{Event: EventLogout, Outcome: OutcomeSuccess})
+	_ = l2.Close()
+
+	if line, err := Verify(path); err != nil || line != 0 {
+		t.Fatalf("Verify after tail reopen = (%d, %v), want (0, nil)", line, err)
+	}
+}
+
+// TestVerifyBlankLinesAndNoTrailingNewline exercises the streaming verifier's
+// handling of blank lines and a final record without a trailing newline.
+func TestVerifyBlankLinesAndNoTrailingNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Log(Event{Event: EventLogin, Outcome: OutcomeSuccess, Identity: "chris"})
+	l.Log(Event{Event: EventLogout, Outcome: OutcomeSuccess, Identity: "chris"})
+	_ = l.Close()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Insert a blank line between the records and drop the trailing newline.
+	data = bytes.Replace(data, []byte("\n"), []byte("\n\n"), 1)
+	data = bytes.TrimRight(data, "\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if line, err := Verify(path); err != nil || line != 0 {
+		t.Fatalf("Verify = (%d, %v), want (0, nil)", line, err)
 	}
 }

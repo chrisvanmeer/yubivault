@@ -17,7 +17,7 @@ YubiVault is an airgapped **Validation Middleware & Vault Delegation Proxy** for
 - **YubiKey Identity Capture & Preview**: The YubiKey serial number, firmware and a stable device fingerprint are extracted from the attestation certificate and shown in a confirmation step before anything is issued.
 - **Device Policy & Pinning**: Enforce a minimum YubiKey firmware and serial (fail-closed), and optionally pin each Common Name to one or more known device fingerprints.
 - **Session Timeouts**: Absolute maximum session age and an inactivity timeout, both configurable.
-- **Live Configuration Reload**: `config.yaml` is re-read every 10 seconds and applied without a restart; a reload is logged only when a change is actually detected.
+- **Live Configuration Reload**: `config.yaml` is checked every 10 seconds and applied without a restart; a reload is logged only when a change is actually detected.
 - **`--check-config` CLI**: Validate the configuration, Yubico roots, Vault/AppRole connectivity and OIDC discovery without starting the service.
 - **`--verify-audit` CLI**: Verify the integrity of the audit trail's hash chain.
 - **Rich Readiness Probe**: `/readyz` reports Vault reachability, OIDC discovery and (when enabled) AppRole authentication.
@@ -170,7 +170,7 @@ Create `config.yaml` in the project root or `/etc/yubivault/config.yaml`. A
 fully commented reference lives in `config.yaml.example`; omitted options fall
 back to the defaults noted below.
 
-The file is reloaded at runtime: it is re-read every 10 seconds and, when its
+The file is reloaded at runtime: it is checked every 10 seconds and, when its
 contents changed, the new configuration is applied live without a restart (a
 reload is logged only when a change is detected). The listen address and the
 log/audit destinations still require a restart.

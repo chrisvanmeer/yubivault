@@ -1,6 +1,6 @@
 # YubiVault configuration.
 #
-# The file is watched at runtime: every 10 seconds it is re-read and, when its
+# The file is watched at runtime: every 10 seconds it is checked and, when its
 # contents changed, applied live without a restart. A reload is logged only when
 # a change is actually detected. The listen address and the log/audit
 # destinations require a restart to take effect.

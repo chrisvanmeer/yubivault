@@ -213,12 +213,26 @@ func watchConfig(ctx context.Context, path string, initial *config.Config, p *po
 	defer ticker.Stop()
 
 	active := initial
+	var appliedInfo os.FileInfo
 	lastErr := ""
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// A stat is far cheaper than reading and parsing the YAML, and
+			// lets an unchanged file (the common case) skip everything.
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				if msg := statErr.Error(); msg != lastErr {
+					slog.Warn("configuration reload skipped: file is unreadable", "path", path, "error", statErr)
+					lastErr = msg
+				}
+				continue
+			}
+			if fileUnchanged(appliedInfo, info) {
+				continue
+			}
 			next, err := config.Load(path)
 			if err != nil {
 				if msg := err.Error(); msg != lastErr {
@@ -229,6 +243,7 @@ func watchConfig(ctx context.Context, path string, initial *config.Config, p *po
 			}
 			lastErr = ""
 			if reflect.DeepEqual(active, next) {
+				appliedInfo = info
 				continue
 			}
 			if err := p.Reload(next); err != nil {
@@ -238,8 +253,19 @@ func watchConfig(ctx context.Context, path string, initial *config.Config, p *po
 			}
 			slog.Info("configuration reloaded", "path", path)
 			active = next
+			appliedInfo = info
 		}
 	}
+}
+
+// fileUnchanged reports whether current refers to the same on-disk state as the
+// previously applied snapshot. It lets the config watchdog skip loading and
+// parsing an unchanged file, and is a no-op when either snapshot is missing.
+func fileUnchanged(prev, current os.FileInfo) bool {
+	if prev == nil || current == nil {
+		return false
+	}
+	return prev.ModTime().Equal(current.ModTime()) && prev.Size() == current.Size()
 }
 
 // newLogger builds the process logger. When file logging is configured it

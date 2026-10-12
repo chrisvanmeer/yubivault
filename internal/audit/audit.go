@@ -10,11 +10,14 @@
 package audit
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -82,13 +85,15 @@ type Logger struct {
 // the file already holds records the chain continues from the last line;
 // when the file is empty or absent it starts from the genesis hash.
 func Open(path string) (*Logger, error) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+	// O_RDWR (not O_WRONLY) so Open can read the tail of an existing log to
+	// resume the hash chain without loading the whole file.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o640)
 	if err != nil {
 		return nil, err
 	}
 	prevHash := genesisHash()
-	if data, err := os.ReadFile(path); err == nil {
-		if last := lastRecord(data); last != nil {
+	if info, statErr := f.Stat(); statErr == nil && info.Size() > 0 {
+		if last := lastLine(f, info.Size()); last != nil {
 			prevHash = hashLine(last)
 		}
 	}
@@ -130,34 +135,49 @@ func (l *Logger) Close() error {
 // Verify walks the chained audit log at path from the genesis hash and
 // reports the line number of the first record whose prev_hash does not match
 // the hash of the preceding line. It returns (0, nil) when every record in
-// the file (including a final partial line) verifies. A Parse error or a
+// the file (including a final partial line) verifies. A parse error or a
 // record missing prev_hash is reported as a broken link too.
+//
+// The file is streamed line by line so memory use does not grow with the size
+// of the audit log.
 func Verify(path string) (int, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
+	defer func() { _ = f.Close() }()
+
+	reader := bufio.NewReader(f)
 	prev := genesisHash()
 	lineNo := 0
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimSuffix(line, []byte{'\n'})
+			if len(bytes.TrimSpace(line)) > 0 {
+				lineNo++
+				var rec struct {
+					PrevHash string `json:"prev_hash"`
+				}
+				if err := json.Unmarshal(line, &rec); err != nil {
+					return lineNo, fmt.Errorf("line %d is not a valid JSON record: %w", lineNo, err)
+				}
+				if rec.PrevHash == "" {
+					return lineNo, fmt.Errorf("line %d is missing prev_hash (not part of the chain)", lineNo)
+				}
+				if !strings.EqualFold(rec.PrevHash, prev) {
+					return lineNo, fmt.Errorf("line %d breaks the chain: prev_hash %s does not match the previous line (%s)",
+						lineNo, rec.PrevHash, prev)
+				}
+				prev = hashLine(line)
+			}
 		}
-		lineNo++
-		var rec struct {
-			PrevHash string `json:"prev_hash"`
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return lineNo, readErr
 		}
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return lineNo, fmt.Errorf("line %d is not a valid JSON record: %w", lineNo, err)
-		}
-		if rec.PrevHash == "" {
-			return lineNo, fmt.Errorf("line %d is missing prev_hash (not part of the chain)", lineNo)
-		}
-		if !strings.EqualFold(rec.PrevHash, prev) {
-			return lineNo, fmt.Errorf("line %d breaks the chain: prev_hash %s does not match the previous line (%s)",
-				lineNo, rec.PrevHash, prev)
-		}
-		prev = hashLine(line)
 	}
 	return 0, nil
 }
@@ -175,14 +195,39 @@ func hashLine(line []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// lastRecord returns the final non-empty line of audit data, or nil when the
-// file has none.
-func lastRecord(data []byte) []byte {
-	lines := bytes.Split(data, []byte{'\n'})
-	for i := len(lines) - 1; i >= 0; i-- {
-		if len(bytes.TrimSpace(lines[i])) > 0 {
-			return lines[i]
+// tailWindow bounds how many trailing bytes lastLine reads before giving up the
+// windowed approach. Audit records are small, so this is far larger than any
+// real line.
+const tailWindow = 64 << 10
+
+// lastLine returns the final non-empty line of the file without reading the
+// whole file: it reads a bounded window from the end and grows it only if the
+// last line does not fit.
+func lastLine(f *os.File, size int64) []byte {
+	window := int64(tailWindow)
+	if window > size {
+		window = size
+	}
+	for {
+		buf := make([]byte, window)
+		if _, err := f.ReadAt(buf, size-window); err != nil && !errors.Is(err, io.EOF) {
+			return nil
+		}
+		trimmed := bytes.TrimRight(buf, "\r\n")
+		if i := bytes.LastIndexByte(trimmed, '\n'); i >= 0 {
+			return trimmed[i+1:]
+		}
+		// No newline in the window: either the whole file fits, or the final
+		// line is unusually long. Read more (bounded by the file size).
+		if window >= size {
+			if len(trimmed) == 0 {
+				return nil
+			}
+			return trimmed
+		}
+		window *= 2
+		if window > size {
+			window = size
 		}
 	}
-	return nil
 }

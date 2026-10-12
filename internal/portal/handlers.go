@@ -12,8 +12,8 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -160,7 +160,7 @@ func (p *Portal) handleLogin(w http.ResponseWriter, r *http.Request) {
 	state := newOAuthState()
 	nonce := newOAuthState()
 
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		renderError(w, http.StatusInternalServerError, "Unable to create a session. Please retry.")
 		return
@@ -184,7 +184,7 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		renderError(w, http.StatusBadRequest, "Session not found. Please log in again.")
 		return
@@ -285,7 +285,7 @@ func (p *Portal) handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Portal) handleLogout(w http.ResponseWriter, r *http.Request) {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err == nil {
 		rawIDToken, _ := session.Values[sessionTokenKey].(string)
 		identity, _ := session.Values[sessionIdentityK].(string)
@@ -888,11 +888,84 @@ func isRelativeAsset(u string) bool {
 	return true
 }
 
+// manualRenderCache memoises rendered manual documents. Rendering runs goldmark
+// over the Markdown, so it is cached and only redone when a file changes
+// (detected via modification time and size).
+type manualRenderCache struct {
+	mu    sync.Mutex
+	items map[string]manualRender
+}
+
+// manualRender is the expensive part of a manual: the rendered HTML, or the
+// fact that it is a PDF. It is keyed by file path plus its stat signature.
+type manualRender struct {
+	modTime time.Time
+	size    int64
+	isPDF   bool
+	html    template.HTML
+}
+
+func newManualRenderCache() *manualRenderCache {
+	return &manualRenderCache{items: make(map[string]manualRender)}
+}
+
+// renderCache returns the process-wide manual render cache, creating it on
+// first use (Portal values built directly in tests never call New).
+func (p *Portal) renderCache() *manualRenderCache {
+	p.manualsOnce.Do(func() {
+		p.manuals = newManualRenderCache()
+	})
+	return p.manuals
+}
+
+// renderManual returns the rendered form of the manual at path, reading and
+// rendering it only when it is new or its modification time and size changed.
+func (p *Portal) renderManual(path string, info os.FileInfo) (manualRender, bool) {
+	cache := p.renderCache()
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if r, ok := cache.items[path]; ok && r.size == info.Size() && r.modTime.Equal(info.ModTime()) {
+		return r, true
+	}
+
+	r := manualRender{modTime: info.ModTime(), size: info.Size()}
+	if strings.EqualFold(filepath.Ext(path), ".pdf") {
+		// The modal only needs to know it is a PDF; the bytes are streamed by
+		// handleManualRaw, so there is no reason to read them here.
+		r.isPDF = true
+	} else {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			p.logger.Warn("failed to read manual file", "path", path, "error", err)
+			return manualRender{}, false
+		}
+		var buf bytes.Buffer
+		if err := manualMarkdown.Convert(data, &buf); err != nil {
+			p.logger.Warn("failed to render manual markdown", "path", path, "error", err)
+			return manualRender{}, false
+		}
+		// goldmark does not render raw HTML unless explicitly enabled, so this
+		// output is safe to inject without additional sanitisation.
+		r.html = template.HTML(buf.String())
+	}
+	cache.items[path] = r
+	return r, true
+}
+
 // loadManualDoc reads and prepares one manual document.
 func (p *Portal) loadManualDoc(key, file string) (manualDoc, bool) {
-	data, err := os.ReadFile(file)
+	info, err := os.Stat(file)
 	if err != nil {
 		p.logger.Warn("failed to read manual file", "path", file, "error", err)
+		return manualDoc{}, false
+	}
+	if info.IsDir() {
+		p.logger.Warn("manual path is a directory", "path", file)
+		return manualDoc{}, false
+	}
+	r, ok := p.renderManual(file, info)
+	if !ok {
 		return manualDoc{}, false
 	}
 	doc := manualDoc{
@@ -900,18 +973,11 @@ func (p *Portal) loadManualDoc(key, file string) (manualDoc, bool) {
 		Label: manualLabel(key),
 		URL:   "/manual/raw?os=" + urlQueryEscape(key),
 	}
-	if strings.EqualFold(filepath.Ext(file), ".pdf") {
+	if r.isPDF {
 		doc.IsPDF = true
-		return doc, true
+	} else {
+		doc.HTML = r.html
 	}
-	var buf bytes.Buffer
-	if err := manualMarkdown.Convert(data, &buf); err != nil {
-		p.logger.Warn("failed to render manual markdown", "path", file, "error", err)
-		return manualDoc{}, false
-	}
-	// goldmark does not render raw HTML unless explicitly enabled, so this
-	// output is safe to inject without additional sanitisation.
-	doc.HTML = template.HTML(buf.String())
 	return doc, true
 }
 
@@ -968,10 +1034,16 @@ func (p *Portal) handleManualRaw(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		p.logger.Error("failed to read manual file", "path", path, "error", err)
 		http.Error(w, "Manual unavailable.", http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
 		return
 	}
 	if strings.EqualFold(filepath.Ext(path), ".pdf") {
@@ -984,8 +1056,9 @@ func (p *Portal) handleManualRaw(w http.ResponseWriter, r *http.Request) {
 		disposition = "attachment"
 	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", disposition, filepath.Base(path)))
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	_, _ = w.Write(data)
+	// ServeContent streams the file instead of buffering it, and adds Range and
+	// conditional (If-Modified-Since) support for free.
+	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
 }
 
 // handleManualAsset serves media (images) referenced from the Markdown manuals.
@@ -1078,7 +1151,7 @@ func parseGroups(v any) []string {
 
 // sessionGroups returns the OIDC group memberships stored in the session.
 func (p *Portal) sessionGroups(r *http.Request) (bool, []string) {
-	session, err := p.cookieStore().Get(r, sessionName)
+	session, err := p.session(r)
 	if err != nil {
 		return false, nil
 	}
